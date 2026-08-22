@@ -190,38 +190,82 @@ export default function Kiosk() {
     !isLoading &&
     (mode === "libre" ? Boolean(texteLibre.trim()) : mode === "numero" ? Boolean(numero.trim() || prenom.trim()) : false);
 
-  async function playAudio(url: string) {
-    const audio = new Audio(url);
-    await audio.play();
-  }
+  const audioRef = useRef<HTMLAudioElement>(null!);
+  const prefetchedRef = useRef<Record<string, string>>({});
+
+  const SILENT_WAV =
+    "data:audio/wav;base64,UklGRigAAABXQVZFZm10IBAAAAABAAEAQB8AAEAfAAABAAgAZGF0YQAAAAA=";
+
+  useEffect(() => {
+    audioRef.current = new Audio(SILENT_WAV);
+  }, []);
+
+  useEffect(() => {
+    if (!canCall) return;
+    const { text, cacheKey } = buildAnnouncement(numero, prenom, texteLibre);
+    if (prefetchedRef.current[cacheKey]) return;
+
+    const timer = setTimeout(() => {
+      fetch("/api/tts", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ text, cacheKey }),
+      })
+        .then((res) => res.json())
+        .then((data) => {
+          if (data.url) {
+            prefetchedRef.current[cacheKey] = data.url;
+          }
+        })
+        .catch(() => {});
+    }, 250);
+
+    return () => clearTimeout(timer);
+  }, [numero, prenom, texteLibre, canCall]);
 
   async function announce(text: string, cacheKey: string, label: string) {
     setError(null);
     setIsLoading(true);
+
+    const audio = audioRef.current;
+
+    // Priming systematique : on remet la source sur un silence
+    // (jamais sur l'audio reel precedent, qui pourrait etre relance et
+    // creer un conflit avec le vrai audio qui va suivre), et on tente
+    // une lecture des le tout debut, avant tout await.
+    audio.src = SILENT_WAV;
+    audio.play().catch(() => {});
+
     try {
-      const res = await fetch("/api/tts", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ text, cacheKey }),
-      });
-      const data = await res.json();
-
-      if (!res.ok) throw new Error(data.error ?? "Erreur inconnue");
-
-      await playAudio(data.url);
+      const cached = prefetchedRef.current[cacheKey];
+      let url: string;
+      if (cached) {
+        url = cached;
+      } else {
+        const res = await fetch("/api/tts", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ text, cacheKey }),
+        });
+        const data = await res.json();
+        if (!res.ok) throw new Error(data.error ?? "Erreur inconnue");
+        url = data.url;
+      }
+      audio.src = url;
+      audio.play().catch(() => {});
 
       setHistory((prev) => [
         {
           id: `${Date.now()}`,
           label,
           time: new Date().toLocaleTimeString("fr-FR", { hour: "2-digit", minute: "2-digit" }),
-          url: data.url,
+          url,
           text,
         },
         ...prev,
       ].slice(0, 12));
     } catch (err) {
-      setError(err instanceof Error ? err.message : "Échec de l'annonce");
+      setError(err instanceof Error ? err.message : "Echec de l'annonce");
     } finally {
       setIsLoading(false);
     }
@@ -246,7 +290,8 @@ export default function Kiosk() {
     try {
       // Le fichier est déjà généré et mis en cache côté serveur : on le
       // rejoue directement, aucun appel à l'API ElevenLabs n'est fait.
-      await playAudio(ticket.url);
+      audioRef.current.src = ticket.url;
+      await audioRef.current.play();
     } catch {
       setError("Impossible de rejouer cette annonce.");
     }
