@@ -1,41 +1,61 @@
-const AUDIO_CACHE = "appelresto-audio-v1";
-const APP_SHELL_CACHE = "appelresto-shell-v1";
+const AUDIO_CACHE = "appelresto-audio-v2";
+const APP_SHELL_CACHE = "appelresto-shell-v2";
 
-self.addEventListener("install", (event) => {
+self.addEventListener("install", () => {
   self.skipWaiting();
 });
 
 self.addEventListener("activate", (event) => {
-  event.waitUntil(self.clients.claim());
+  event.waitUntil(
+    (async () => {
+      // Supprime TOUS les anciens caches : élimine les reponses viciees
+      // laissees par les versions precedentes sur chaque appareil
+      const keys = await caches.keys();
+      await Promise.all(keys.map((k) => caches.delete(k)));
+      await self.clients.claim();
+    })()
+  );
 });
 
-// Stratégie : les fichiers audio générés (/audio/generated/*.mp3) sont
-// "cache first" — une fois qu'un prénom ou un numéro a été prononcé une
-// fois, il reste disponible même si le wifi du restaurant tombe.
 self.addEventListener("fetch", (event) => {
+  // Jamais d'interception des POST (api/tts, login, etc.)
+  if (event.request.method !== "GET") return;
+
   const url = new URL(event.request.url);
 
+  // Jamais d'interception des appels API : toujours le reseau
+  if (url.pathname.startsWith("/api/")) return;
+
+  // Audio genere : reseau d'abord, cache local uniquement si la
+  // reponse est valide, repli sur le cache si le wifi tombe
   if (url.pathname.startsWith("/audio/generated/")) {
     event.respondWith(
-      caches.open(AUDIO_CACHE).then(async (cache) => {
-        const cached = await cache.match(event.request);
-        if (cached) return cached;
-
-        const response = await fetch(event.request);
-        if (response.ok) cache.put(event.request, response.clone());
-        return response;
-      })
+      (async () => {
+        try {
+          const response = await fetch(event.request);
+          if (response.ok) {
+            const cache = await caches.open(AUDIO_CACHE);
+            cache.put(event.request, response.clone());
+          }
+          return response;
+        } catch {
+          const cached = await caches.match(event.request);
+          if (cached) return cached;
+          throw new Error("Hors ligne et audio absent du cache");
+        }
+      })()
     );
     return;
   }
 
-  // App shell : network first, fallback cache (pour garder l'UI
-  // à jour quand la connexion est bonne, mais utilisable hors-ligne)
+  // App shell : reseau d'abord, cache uniquement des reponses OK
   event.respondWith(
     fetch(event.request)
-      .then((response) => {
-        const clone = response.clone();
-        caches.open(APP_SHELL_CACHE).then((cache) => cache.put(event.request, clone));
+      .then(async (response) => {
+        if (response.ok && url.origin === self.location.origin) {
+          const cache = await caches.open(APP_SHELL_CACHE);
+          cache.put(event.request, response.clone());
+        }
         return response;
       })
       .catch(() => caches.match(event.request))

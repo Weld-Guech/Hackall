@@ -9,7 +9,7 @@ import { getClientById } from "@/lib/clients";
 // En prod, préfère un stockage persistant (S3, Vercel Blob...) car le
 // filesystem d'une fonction serverless n'est pas garanti de survivre entre
 // deux invocations.
-const CACHE_ROOT = path.join(process.cwd(), "public", "audio", "generated");
+const CACHE_ROOT = path.join(process.cwd(), "audio-cache");
 
 function normalizeKey(text: string) {
   return text
