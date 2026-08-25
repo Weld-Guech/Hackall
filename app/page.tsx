@@ -5,6 +5,7 @@ import { useRouter } from "next/navigation";
 import { useWakeLock } from "@/hooks/useWakeLock";
 import { PRENOMS_ARABES } from "@/lib/prenomsArabes";
 import { PHONETIC_MAP } from "@/lib/phoneticCorrections";
+import { normalizeName } from "@/lib/normalizeName";
 
 type Ticket = {
   id: string;
@@ -23,13 +24,6 @@ type Routine = {
 type Mode = "numero" | "libre" | "routines";
 
 const MAX_SUGGESTIONS = 6;
-
-function normalize(s: string): string {
-  return s
-    .toLowerCase()
-    .normalize("NFD")
-    .replace(/[̀-ͯ]/g, "");
-}
 
 // Convertit un nombre (0-999) en toutes lettres françaises, pour éviter
 // que le TTS ne lise les chiffres un par un sur les nombres composés
@@ -96,6 +90,40 @@ function buildAnnouncement(
   };
 }
 
+type GroupEntry = {
+  raw: string;
+  spoken: string;
+  label: string;
+  key: string;
+  isName: boolean;
+};
+
+// Regroupe jusqu'à 3 identifiants (prénoms et/ou numéros) dans une seule
+// annonce : "La commande X est prête." pour un seul, "Les commandes X, Y
+// et Z sont prêtes." à partir de deux.
+function buildGroupAnnouncement(
+  entries: GroupEntry[]
+): { text: string; cacheKey: string; label: string } {
+  if (entries.length <= 1) {
+    const e = entries[0];
+    return {
+      text: `La commande ${e.spoken} est prête.`,
+      cacheKey: e.key,
+      label: e.label,
+    };
+  }
+  const spokenList = entries.map((e) => e.spoken);
+  const joined =
+    spokenList.length === 2
+      ? spokenList.join(" et ")
+      : `${spokenList.slice(0, -1).join(", ")} et ${spokenList[spokenList.length - 1]}`;
+  return {
+    text: `Les commandes ${joined} sont prêtes.`,
+    cacheKey: `groupe_${entries.map((e) => e.key).join("__")}`,
+    label: entries.map((e) => e.label).join(", "),
+  };
+}
+
 export default function Kiosk() {
   const router = useRouter();
   const [mounted, setMounted] = useState(false);
@@ -111,15 +139,16 @@ export default function Kiosk() {
   const [clientId, setClientId] = useState<string | null>(null);
   const [restaurantName, setRestaurantName] = useState("");
   const [routines, setRoutines] = useState<Routine[]>([]);
+  const [customNames, setCustomNames] = useState<string[]>([]);
+  const [groupItems, setGroupItems] = useState<GroupEntry[]>([]);
   const { active: wakeLockActive, supported: wakeLockSupported } = useWakeLock();
   const suggestionsRef = useRef<HTMLDivElement>(null);
 
   const suggestions =
     prenom.trim().length > 0
-      ? PRENOMS_ARABES.filter((n) => normalize(n).startsWith(normalize(prenom.trim()))).slice(
-          0,
-          MAX_SUGGESTIONS
-        )
+      ? [...PRENOMS_ARABES, ...customNames]
+          .filter((n) => normalizeName(n).startsWith(normalizeName(prenom.trim())))
+          .slice(0, MAX_SUGGESTIONS)
       : [];
 
   useEffect(() => {
@@ -147,6 +176,7 @@ export default function Kiosk() {
       setClientId(data.id);
       setRestaurantName(data.restaurantName ?? "");
       setRoutines(Array.isArray(data.routines) ? data.routines : []);
+      setCustomNames(Array.isArray(data.customNames) ? data.customNames : []);
     });
   }, [router]);
 
@@ -188,7 +218,11 @@ export default function Kiosk() {
   const canCall =
     mounted &&
     !isLoading &&
-    (mode === "libre" ? Boolean(texteLibre.trim()) : mode === "numero" ? Boolean(numero.trim() || prenom.trim()) : false);
+    (mode === "libre"
+      ? Boolean(texteLibre.trim())
+      : mode === "numero"
+      ? Boolean(numero.trim() || prenom.trim() || groupItems.length > 0)
+      : false);
 
   const audioRef = useRef<HTMLAudioElement>(null!);
   const prefetchedRef = useRef<Record<string, string>>({});
@@ -223,7 +257,47 @@ export default function Kiosk() {
     return () => clearTimeout(timer);
   }, [numero, prenom, texteLibre, canCall]);
 
-  async function announce(text: string, cacheKey: string, label: string) {
+  // Le "+" côté du champ prénom empile jusqu'à 3 identifiants (prénom ou
+  // numéro) pour une annonce groupée ; currentEntry() lit ce qui est
+  // actuellement tapé, sans encore l'ajouter au groupe.
+  function currentEntry(): GroupEntry | null {
+    if (prenom.trim()) {
+      const raw = prenom.trim();
+      return {
+        raw,
+        spoken: PHONETIC_MAP[raw.toLowerCase()] ?? raw,
+        label: raw,
+        key: `prenom_${raw}`,
+        isName: true,
+      };
+    }
+    if (numero.trim()) {
+      const raw = numero.trim();
+      return {
+        raw,
+        spoken: numberToFrenchWords(parseInt(raw, 10) || 0),
+        label: `N° ${raw}`,
+        key: `numero_${raw}`,
+        isName: false,
+      };
+    }
+    return null;
+  }
+
+  function addToGroup() {
+    const entry = currentEntry();
+    if (!entry || groupItems.length >= 3) return;
+    setGroupItems((g) => [...g, entry]);
+    setNumero("");
+    setPrenom("");
+    setShowSuggestions(false);
+  }
+
+  function removeFromGroup(index: number) {
+    setGroupItems((g) => g.filter((_, i) => i !== index));
+  }
+
+  async function announce(text: string, cacheKey: string, label: string): Promise<boolean> {
     setError(null);
     setIsLoading(true);
 
@@ -264,20 +338,66 @@ export default function Kiosk() {
         },
         ...prev,
       ].slice(0, 12));
+      return true;
     } catch (err) {
-      setError(err instanceof Error ? err.message : "Echec de l'annonce");
+      setError(err instanceof Error ? err.message : "Échec de l'annonce");
+      return false;
     } finally {
       setIsLoading(false);
     }
   }
 
+  // Un prénom tapé qui n'est ni dans la liste suggérée ni déjà appris est
+  // enregistré silencieusement pour ce client : il sera suggéré la
+  // prochaine fois. Appelé seulement après une annonce réussie.
+  async function learnNameIfNew(name: string) {
+    const trimmed = name.trim();
+    if (!trimmed) return;
+    const known = [...PRENOMS_ARABES, ...customNames].some(
+      (n) => normalizeName(n) === normalizeName(trimmed)
+    );
+    if (known) return;
+    try {
+      const res = await fetch("/api/prenoms", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ prenom: trimmed }),
+      });
+      if (!res.ok) return;
+      const data = await res.json();
+      if (Array.isArray(data.customNames)) setCustomNames(data.customNames);
+    } catch {
+      // Best-effort : un raté ici ne doit jamais bloquer le kiosque.
+    }
+  }
+
   async function handleCall() {
     if (!canCall) return;
-    const { text, cacheKey, label } = buildAnnouncement(numero, prenom, texteLibre);
-    await announce(text, cacheKey, label);
+
+    if (mode === "libre") {
+      const { text, cacheKey, label } = buildAnnouncement(numero, prenom, texteLibre);
+      await announce(text, cacheKey, label);
+      setTexteLibre("");
+      return;
+    }
+
+    // Mode numéro/prénom : on inclut ce qui est encore tapé (non ajouté via
+    // le "+") comme dernier élément du groupe, dans la limite de 3.
+    const current = currentEntry();
+    const entries =
+      groupItems.length >= 3 ? groupItems : [...groupItems, ...(current ? [current] : [])];
+    if (entries.length === 0) return;
+
+    const { text, cacheKey, label } = buildGroupAnnouncement(entries);
+    const ok = await announce(text, cacheKey, label);
+    if (ok) {
+      entries.forEach((e) => {
+        if (e.isName) learnNameIfNew(e.raw);
+      });
+    }
     setNumero("");
     setPrenom("");
-    setTexteLibre("");
+    setGroupItems([]);
   }
 
   async function handleRoutineCall(routine: Routine) {
@@ -404,36 +524,68 @@ export default function Kiosk() {
             <>
               <div style={styles.display}>
                 <span style={styles.displayValue}>{numero || "—"}</span>
-                <div style={styles.prenomWrap} ref={suggestionsRef}>
-                  <input
-                    style={styles.prenomInput}
-                    placeholder="ou saisir un prénom"
-                    value={prenom}
-                    onChange={(e) => {
-                      setPrenom(e.target.value);
-                      setNumero("");
-                      setShowSuggestions(true);
+                <div style={styles.prenomRow}>
+                  <div style={styles.prenomWrap} ref={suggestionsRef}>
+                    <input
+                      style={styles.prenomInput}
+                      placeholder="ou saisir un prénom"
+                      value={prenom}
+                      onChange={(e) => {
+                        setPrenom(e.target.value);
+                        setNumero("");
+                        setShowSuggestions(true);
+                      }}
+                      onFocus={() => setShowSuggestions(true)}
+                    />
+                    {showSuggestions && suggestions.length > 0 && (
+                      <div style={styles.suggestionList}>
+                        {suggestions.map((s) => (
+                          <button
+                            key={s}
+                            type="button"
+                            style={styles.suggestionItem}
+                            onClick={() => {
+                              setPrenom(s);
+                              setShowSuggestions(false);
+                            }}
+                          >
+                            {s}
+                          </button>
+                        ))}
+                      </div>
+                    )}
+                  </div>
+                  <button
+                    type="button"
+                    style={{
+                      ...styles.groupAddButton,
+                      opacity: !currentEntry() || groupItems.length >= 3 ? 0.4 : 1,
                     }}
-                    onFocus={() => setShowSuggestions(true)}
-                  />
-                  {showSuggestions && suggestions.length > 0 && (
-                    <div style={styles.suggestionList}>
-                      {suggestions.map((s) => (
-                        <button
-                          key={s}
-                          type="button"
-                          style={styles.suggestionItem}
-                          onClick={() => {
-                            setPrenom(s);
-                            setShowSuggestions(false);
-                          }}
-                        >
-                          {s}
-                        </button>
-                      ))}
-                    </div>
-                  )}
+                    onClick={addToGroup}
+                    disabled={!currentEntry() || groupItems.length >= 3}
+                    title="Ajouter à une commande groupée (max 3)"
+                  >
+                    +
+                  </button>
                 </div>
+
+                {groupItems.length > 0 && (
+                  <div style={styles.groupChips}>
+                    {groupItems.map((g, i) => (
+                      <span key={`${g.key}_${i}`} style={styles.chip}>
+                        {g.label}
+                        <button
+                          type="button"
+                          style={styles.chipRemove}
+                          onClick={() => removeFromGroup(i)}
+                          title="Retirer du groupe"
+                        >
+                          ×
+                        </button>
+                      </span>
+                    ))}
+                  </div>
+                )}
               </div>
 
               <div style={styles.keypad}>
@@ -649,9 +801,56 @@ const styles: Record<string, React.CSSProperties> = {
     letterSpacing: "0.02em",
     color: "var(--text)",
   },
+  prenomRow: {
+    display: "flex",
+    alignItems: "center",
+    gap: 10,
+  },
   prenomWrap: {
     position: "relative",
     width: 260,
+  },
+  groupAddButton: {
+    flexShrink: 0,
+    width: 36,
+    height: 36,
+    borderRadius: "50%",
+    background: "var(--surface-raised)",
+    border: "1px solid var(--border)",
+    color: "var(--text)",
+    fontFamily: "var(--font-body)",
+    fontSize: 20,
+    lineHeight: 1,
+    cursor: "pointer",
+  },
+  groupChips: {
+    display: "flex",
+    flexWrap: "wrap",
+    justifyContent: "center",
+    gap: 8,
+    marginTop: 12,
+    maxWidth: 320,
+  },
+  chip: {
+    display: "inline-flex",
+    alignItems: "center",
+    gap: 6,
+    background: "var(--surface-raised)",
+    border: "1px solid var(--border)",
+    borderRadius: 999,
+    color: "var(--text)",
+    fontFamily: "var(--font-body)",
+    fontSize: 13,
+    padding: "6px 8px 6px 12px",
+  },
+  chipRemove: {
+    background: "transparent",
+    border: "none",
+    color: "var(--text-muted)",
+    fontSize: 15,
+    lineHeight: 1,
+    cursor: "pointer",
+    padding: 0,
   },
   prenomInput: {
     background: "transparent",

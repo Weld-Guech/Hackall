@@ -2,6 +2,8 @@ import fs from "fs";
 import path from "path";
 import crypto from "crypto";
 import { hashPassword, verifyPassword } from "./password";
+import { normalizeName } from "./normalizeName";
+import { PRENOMS_ARABES } from "./prenomsArabes";
 
 // Stockage fichier volontairement simple (pas de base de données dans ce
 // projet). Sur un serveur/VPS classique, data/clients.json persiste entre
@@ -10,6 +12,7 @@ import { hashPassword, verifyPassword } from "./password";
 const DATA_DIR = path.join(process.cwd(), "data");
 const DATA_FILE = path.join(DATA_DIR, "clients.json");
 const MAX_ROUTINES = 12;
+const MAX_CUSTOM_NAMES = 500;
 
 export type Routine = {
   id: string;
@@ -25,6 +28,7 @@ export type Client = {
   voiceId: string;
   active: boolean;
   routines: Routine[];
+  customNames: string[];
   createdAt: string;
 };
 
@@ -34,13 +38,19 @@ function readAll(): Client[] {
   try {
     const raw = JSON.parse(fs.readFileSync(DATA_FILE, "utf8")) as (Omit<
       Client,
-      "active" | "routines"
+      "active" | "routines" | "customNames"
     > & {
       active?: boolean;
       routines?: Routine[];
+      customNames?: string[];
     })[];
-    // Comptes créés avant l'ajout des champs `active`/`routines` : valeurs par défaut.
-    return raw.map((c) => ({ ...c, active: c.active ?? true, routines: c.routines ?? [] }));
+    // Comptes créés avant l'ajout des champs `active`/`routines`/`customNames` : valeurs par défaut.
+    return raw.map((c) => ({
+      ...c,
+      active: c.active ?? true,
+      routines: c.routines ?? [],
+      customNames: c.customNames ?? [],
+    }));
   } catch {
     return [];
   }
@@ -92,6 +102,7 @@ export function createClient(input: {
     voiceId: input.voiceId.trim(),
     active: true,
     routines: [],
+    customNames: [],
     createdAt: new Date().toISOString(),
   };
   clients.push(client);
@@ -189,4 +200,28 @@ export function deleteRoutine(clientId: string, routineId: string): boolean {
   client.routines = next;
   writeAll(clients);
   return true;
+}
+
+// Enregistre automatiquement un prénom saisi au kiosque qui n'est ni dans la
+// liste des prénoms arabes suggérés, ni déjà appris pour ce client — pour
+// qu'il apparaisse en suggestion dès la prochaine saisie. Ne renvoie pas
+// d'erreur si le prénom est déjà connu : c'est l'appel silencieux normal.
+export function addCustomName(clientId: string, name: string): string[] | undefined {
+  const trimmed = name.trim();
+  if (!trimmed) return undefined;
+
+  const clients = readAll();
+  const client = clients.find((c) => c.id === clientId);
+  if (!client) return undefined;
+
+  const norm = normalizeName(trimmed);
+  const alreadyKnown =
+    PRENOMS_ARABES.some((n) => normalizeName(n) === norm) ||
+    client.customNames.some((n) => normalizeName(n) === norm);
+
+  if (!alreadyKnown && client.customNames.length < MAX_CUSTOM_NAMES) {
+    client.customNames.push(trimmed);
+    writeAll(clients);
+  }
+  return client.customNames;
 }

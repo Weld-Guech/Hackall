@@ -18,6 +18,7 @@ export async function GET() {
     restaurantName: client.restaurantName,
     voiceId: client.voiceId,
     routines: client.routines,
+    customNames: client.customNames,
   });
 }
 
