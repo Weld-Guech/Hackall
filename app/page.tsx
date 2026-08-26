@@ -306,7 +306,13 @@ export default function Kiosk() {
     // Priming systematique : on remet la source sur un silence
     // (jamais sur l'audio reel precedent, qui pourrait etre relance et
     // creer un conflit avec le vrai audio qui va suivre), et on tente
-    // une lecture des le tout debut, avant tout await.
+    // une lecture des le tout debut, avant tout await. En boucle : ce WAV
+    // silencieux dure 0 echantillon, donc sans loop il repasse en pause
+    // avant la fin de la generation ElevenLabs pour un prenom jamais
+    // appele (plus lent qu'un cache hit) — le play() du vrai fichier est
+    // alors traite comme un nouvel autoplay sans geste utilisateur et
+    // bloque silencieusement par le navigateur.
+    audio.loop = true;
     audio.src = SILENT_WAV;
     audio.play().catch(() => {});
 
@@ -325,8 +331,11 @@ export default function Kiosk() {
         if (!res.ok) throw new Error(data.error ?? "Erreur inconnue");
         url = data.url;
       }
+      audio.loop = false;
       audio.src = url;
-      audio.play().catch(() => {});
+      audio.play().catch(() => {
+        setError("Le son n'a pas pu démarrer — réessaie ou rejoue-le depuis l'historique.");
+      });
 
       setHistory((prev) => [
         {
