@@ -25,6 +25,37 @@ type Mode = "numero" | "libre" | "routines";
 
 const MAX_SUGGESTIONS = 6;
 
+// Génère un court WAV silencieux VALIDE (0,3 s) sous forme d'URL blob.
+// Un data-URI « vide » (data chunk de 0 échantillon) échoue à la lecture
+// sur Safari/Chrome mobile : le play() de priming est rejeté, l'élément
+// <audio> n'est donc jamais débloqué par le geste utilisateur, et le vrai
+// fichier qui suit est refusé en silence par le navigateur. D'où : « souvent
+// le nom n'est pas appelé, je dois recliquer plusieurs fois ».
+function makeSilentWavUrl(): string {
+  const sampleRate = 8000;
+  const samples = Math.floor(sampleRate * 0.3);
+  const buffer = new ArrayBuffer(44 + samples);
+  const view = new DataView(buffer);
+  const writeStr = (offset: number, s: string) => {
+    for (let i = 0; i < s.length; i++) view.setUint8(offset + i, s.charCodeAt(i));
+  };
+  writeStr(0, "RIFF");
+  view.setUint32(4, 36 + samples, true);
+  writeStr(8, "WAVE");
+  writeStr(12, "fmt ");
+  view.setUint32(16, 16, true);
+  view.setUint16(20, 1, true); // PCM
+  view.setUint16(22, 1, true); // mono
+  view.setUint32(24, sampleRate, true);
+  view.setUint32(28, sampleRate, true); // byteRate (8 bits mono)
+  view.setUint16(32, 1, true); // blockAlign
+  view.setUint16(34, 8, true); // bitsPerSample
+  writeStr(36, "data");
+  view.setUint32(40, samples, true);
+  for (let i = 0; i < samples; i++) view.setUint8(44 + i, 128); // silence 8 bits non signé
+  return URL.createObjectURL(new Blob([buffer], { type: "audio/wav" }));
+}
+
 // Convertit un nombre (0-999) en toutes lettres françaises, pour éviter
 // que le TTS ne lise les chiffres un par un sur les nombres composés
 // (125 lu "cent vingt-cinq" plutôt que "un deux cinq").
@@ -226,12 +257,43 @@ export default function Kiosk() {
 
   const audioRef = useRef<HTMLAudioElement>(null!);
   const prefetchedRef = useRef<Record<string, string>>({});
-
-  const SILENT_WAV =
-    "data:audio/wav;base64,UklGRigAAABXQVZFZm10IBAAAAABAAEAQB8AAEAfAAABAAgAZGF0YQAAAAA=";
+  const silentUrlRef = useRef<string>("");
+  const audioUnlockedRef = useRef(false);
 
   useEffect(() => {
-    audioRef.current = new Audio(SILENT_WAV);
+    const silent = makeSilentWavUrl();
+    silentUrlRef.current = silent;
+    const audio = new Audio(silent);
+    audio.preload = "auto";
+    audioRef.current = audio;
+
+    // Débloque l'élément <audio> au tout premier contact avec l'écran, une
+    // seule fois. Sur tablette, un <audio> n'a le droit de jouer par la
+    // suite sans geste que s'il a déjà joué au moins une fois PENDANT un
+    // geste utilisateur. On profite donc du premier tap n'importe où (y
+    // compris le tap sur APPELER lui-même) pour l'amorcer.
+    const unlock = () => {
+      const a = audioRef.current;
+      if (!a || audioUnlockedRef.current) return;
+      a.src = silent;
+      a.play()
+        .then(() => {
+          a.pause();
+          a.currentTime = 0;
+          audioUnlockedRef.current = true;
+          window.removeEventListener("pointerdown", unlock);
+          window.removeEventListener("touchend", unlock);
+        })
+        .catch(() => {});
+    };
+    window.addEventListener("pointerdown", unlock);
+    window.addEventListener("touchend", unlock);
+
+    return () => {
+      window.removeEventListener("pointerdown", unlock);
+      window.removeEventListener("touchend", unlock);
+      URL.revokeObjectURL(silent);
+    };
   }, []);
 
   useEffect(() => {
@@ -303,17 +365,14 @@ export default function Kiosk() {
 
     const audio = audioRef.current;
 
-    // Priming systematique : on remet la source sur un silence
-    // (jamais sur l'audio reel precedent, qui pourrait etre relance et
-    // creer un conflit avec le vrai audio qui va suivre), et on tente
-    // une lecture des le tout debut, avant tout await. En boucle : ce WAV
-    // silencieux dure 0 echantillon, donc sans loop il repasse en pause
-    // avant la fin de la generation ElevenLabs pour un prenom jamais
-    // appele (plus lent qu'un cache hit) — le play() du vrai fichier est
-    // alors traite comme un nouvel autoplay sans geste utilisateur et
-    // bloque silencieusement par le navigateur.
+    // Priming systématique : on remet la source sur un silence VALIDE et on
+    // le laisse tourner en boucle. Tant que la génération ElevenLabs d'un
+    // prénom jamais appelé est en cours (plus lente qu'un cache hit),
+    // l'élément reste réellement en lecture — le play() du vrai fichier qui
+    // suit est alors traité comme la continuation d'une lecture en cours et
+    // non comme un nouvel autoplay sans geste, que le navigateur bloquerait.
     audio.loop = true;
-    audio.src = SILENT_WAV;
+    audio.src = silentUrlRef.current;
     audio.play().catch(() => {});
 
     try {
@@ -333,9 +392,18 @@ export default function Kiosk() {
       }
       audio.loop = false;
       audio.src = url;
-      audio.play().catch(() => {
-        setError("Le son n'a pas pu démarrer — réessaie ou rejoue-le depuis l'historique.");
-      });
+      try {
+        await audio.play();
+      } catch {
+        // Un premier échec juste après un changement de src est fréquent sur
+        // tablette : on laisse le navigateur souffler et on retente une fois.
+        await new Promise((r) => setTimeout(r, 150));
+        try {
+          await audio.play();
+        } catch {
+          setError("Le son n'a pas pu démarrer — réessaie ou rejoue-le depuis l'historique.");
+        }
+      }
 
       setHistory((prev) => [
         {
@@ -419,8 +487,10 @@ export default function Kiosk() {
     try {
       // Le fichier est déjà généré et mis en cache côté serveur : on le
       // rejoue directement, aucun appel à l'API ElevenLabs n'est fait.
-      audioRef.current.src = ticket.url;
-      await audioRef.current.play();
+      const audio = audioRef.current;
+      audio.loop = false;
+      audio.src = ticket.url;
+      await audio.play();
     } catch {
       setError("Impossible de rejouer cette annonce.");
     }
