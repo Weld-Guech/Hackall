@@ -259,6 +259,11 @@ export default function Kiosk() {
   const prefetchedRef = useRef<Record<string, string>>({});
   const silentUrlRef = useRef<string>("");
   const audioUnlockedRef = useRef(false);
+  // Verrou synchrone (contrairement à isLoading, mis à jour immédiatement,
+  // sans attendre un re-render React) : évite que deux annonces se
+  // chevauchent sur le même <audio> partagé quand on enchaîne deux appels
+  // très rapprochés (double-tap, ou appel juste après un rejouer).
+  const isAnnouncingRef = useRef(false);
 
   useEffect(() => {
     const silent = makeSilentWavUrl();
@@ -296,9 +301,21 @@ export default function Kiosk() {
     };
   }, []);
 
+  // Pré-chauffe uniquement les NUMÉROS (ensemble borné 000-999, donc sans
+  // risque : au pire on génère quelques dizaines de fichiers qui resserviront
+  // toujours). Les prénoms et le texte libre ne sont PLUS pré-générés à
+  // chaque pause de frappe : sur un ensemble illimité (n'importe quel
+  // prénom), ça déclenchait un vrai appel ElevenLabs payant pour CHAQUE
+  // pause pendant la saisie ("prenom_e", "prenom_ay", "prenom_aym"...),
+  // gaspillant du quota et déclenchant des 429 qui faisaient ensuite
+  // échouer l'appel réel du prénom complet. Ils sont désormais générés une
+  // seule fois, au moment de l'appui sur APPELER.
   useEffect(() => {
     if (!canCall) return;
+    if (mode !== "numero" || prenom.trim() || groupItems.length > 0) return;
+
     const { text, cacheKey } = buildAnnouncement(numero, prenom, texteLibre);
+    if (!cacheKey.startsWith("numero_")) return;
     if (prefetchedRef.current[cacheKey]) return;
 
     const timer = setTimeout(() => {
@@ -317,7 +334,7 @@ export default function Kiosk() {
     }, 250);
 
     return () => clearTimeout(timer);
-  }, [numero, prenom, texteLibre, canCall]);
+  }, [numero, prenom, texteLibre, canCall, mode, groupItems.length]);
 
   // Le "+" côté du champ prénom empile jusqu'à 3 identifiants (prénom ou
   // numéro) pour une annonce groupée ; currentEntry() lit ce qui est
@@ -360,6 +377,13 @@ export default function Kiosk() {
   }
 
   async function announce(text: string, cacheKey: string, label: string): Promise<boolean> {
+    // isLoading seul ne suffit pas : c'est un state React, mis à jour de
+    // façon asynchrone, donc deux appels déclenchés à quelques millisecondes
+    // d'écart (double-tap sur tablette) peuvent tous les deux le lire à
+    // `false` et démarrer en même temps sur le même élément <audio>.
+    if (isAnnouncingRef.current) return false;
+    isAnnouncingRef.current = true;
+
     setError(null);
     setIsLoading(true);
 
@@ -421,6 +445,7 @@ export default function Kiosk() {
       return false;
     } finally {
       setIsLoading(false);
+      isAnnouncingRef.current = false;
     }
   }
 
@@ -483,6 +508,10 @@ export default function Kiosk() {
   }
 
   async function handleReplay(ticket: Ticket) {
+    // Même verrou que announce() : on ne coupe pas une annonce en cours en
+    // rejouant l'historique par-dessus le même <audio> partagé.
+    if (isAnnouncingRef.current) return;
+    isAnnouncingRef.current = true;
     setError(null);
     try {
       // Le fichier est déjà généré et mis en cache côté serveur : on le
@@ -493,6 +522,8 @@ export default function Kiosk() {
       await audio.play();
     } catch {
       setError("Impossible de rejouer cette annonce.");
+    } finally {
+      isAnnouncingRef.current = false;
     }
   }
 
