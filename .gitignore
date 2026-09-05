@@ -3,3 +3,4 @@ node_modules
 .env.local
 public/audio/generated
 data
+audio-cache
