@@ -174,6 +174,13 @@ export default function Kiosk() {
   const [groupItems, setGroupItems] = useState<GroupEntry[]>([]);
   const { active: wakeLockActive, supported: wakeLockSupported } = useWakeLock();
   const suggestionsRef = useRef<HTMLDivElement>(null);
+  // Élément <audio> réel du DOM (rendu dans le JSX ci-dessous). Sur iPad en
+  // PWA standalone (WKWebView), un élément créé via `new Audio()` et jamais
+  // attaché au DOM peut perdre de façon intermittente le déblocage
+  // "autorisé à jouer sans geste utilisateur" — typiquement après une veille
+  // d'écran ou un changement d'app. Un <audio> présent dans le DOM est
+  // beaucoup plus fiable pour conserver cette permission.
+  const audioRef = useRef<HTMLAudioElement>(null!);
 
   const suggestions =
     prenom.trim().length > 0
@@ -255,7 +262,6 @@ export default function Kiosk() {
       ? Boolean(numero.trim() || prenom.trim() || groupItems.length > 0)
       : false);
 
-  const audioRef = useRef<HTMLAudioElement>(null!);
   const prefetchedRef = useRef<Record<string, string>>({});
   const silentUrlRef = useRef<string>("");
   const audioUnlockedRef = useRef(false);
@@ -268,9 +274,9 @@ export default function Kiosk() {
   useEffect(() => {
     const silent = makeSilentWavUrl();
     silentUrlRef.current = silent;
-    const audio = new Audio(silent);
+    const audio = audioRef.current;
     audio.preload = "auto";
-    audioRef.current = audio;
+    audio.src = silent;
 
     // Débloque l'élément <audio> au tout premier contact avec l'écran, une
     // seule fois. Sur tablette, un <audio> n'a le droit de jouer par la
@@ -397,7 +403,11 @@ export default function Kiosk() {
     // non comme un nouvel autoplay sans geste, que le navigateur bloquerait.
     audio.loop = true;
     audio.src = silentUrlRef.current;
-    audio.play().catch(() => {});
+    try {
+      await audio.play();
+    } catch {
+      // on continue quand même : le retry sur le vrai fichier gère l'échec
+    }
 
     try {
       const cached = prefetchedRef.current[cacheKey];
@@ -540,6 +550,7 @@ export default function Kiosk() {
 
   return (
     <main style={styles.main}>
+      <audio ref={audioRef} playsInline style={{ display: "none" }} />
       <header style={styles.header}>
         <span style={styles.eyebrow}>
           {(restaurantName || "…").toUpperCase()} · COMPTOIR
