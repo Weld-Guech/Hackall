@@ -25,37 +25,6 @@ type Mode = "numero" | "libre" | "routines";
 
 const MAX_SUGGESTIONS = 6;
 
-// Génère un court WAV silencieux VALIDE (0,3 s) sous forme d'URL blob.
-// Un data-URI « vide » (data chunk de 0 échantillon) échoue à la lecture
-// sur Safari/Chrome mobile : le play() de priming est rejeté, l'élément
-// <audio> n'est donc jamais débloqué par le geste utilisateur, et le vrai
-// fichier qui suit est refusé en silence par le navigateur. D'où : « souvent
-// le nom n'est pas appelé, je dois recliquer plusieurs fois ».
-function makeSilentWavUrl(): string {
-  const sampleRate = 8000;
-  const samples = Math.floor(sampleRate * 0.3);
-  const buffer = new ArrayBuffer(44 + samples);
-  const view = new DataView(buffer);
-  const writeStr = (offset: number, s: string) => {
-    for (let i = 0; i < s.length; i++) view.setUint8(offset + i, s.charCodeAt(i));
-  };
-  writeStr(0, "RIFF");
-  view.setUint32(4, 36 + samples, true);
-  writeStr(8, "WAVE");
-  writeStr(12, "fmt ");
-  view.setUint32(16, 16, true);
-  view.setUint16(20, 1, true); // PCM
-  view.setUint16(22, 1, true); // mono
-  view.setUint32(24, sampleRate, true);
-  view.setUint32(28, sampleRate, true); // byteRate (8 bits mono)
-  view.setUint16(32, 1, true); // blockAlign
-  view.setUint16(34, 8, true); // bitsPerSample
-  writeStr(36, "data");
-  view.setUint32(40, samples, true);
-  for (let i = 0; i < samples; i++) view.setUint8(44 + i, 128); // silence 8 bits non signé
-  return URL.createObjectURL(new Blob([buffer], { type: "audio/wav" }));
-}
-
 // Convertit un nombre (0-999) en toutes lettres françaises, pour éviter
 // que le TTS ne lise les chiffres un par un sur les nombres composés
 // (125 lu "cent vingt-cinq" plutôt que "un deux cinq").
@@ -165,6 +134,7 @@ export default function Kiosk() {
   const [history, setHistory] = useState<Ticket[]>([]);
   const [isLoading, setIsLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [debug, setDebug] = useState<string>(""); // ligne de diagnostic à l'écran
   const [clock, setClock] = useState("");
   const [showSuggestions, setShowSuggestions] = useState(false);
   const [clientId, setClientId] = useState<string | null>(null);
@@ -174,13 +144,22 @@ export default function Kiosk() {
   const [groupItems, setGroupItems] = useState<GroupEntry[]>([]);
   const { active: wakeLockActive, supported: wakeLockSupported } = useWakeLock();
   const suggestionsRef = useRef<HTMLDivElement>(null);
-  // Élément <audio> réel du DOM (rendu dans le JSX ci-dessous). Sur iPad en
-  // PWA standalone (WKWebView), un élément créé via `new Audio()` et jamais
-  // attaché au DOM peut perdre de façon intermittente le déblocage
-  // "autorisé à jouer sans geste utilisateur" — typiquement après une veille
-  // d'écran ou un changement d'app. Un <audio> présent dans le DOM est
-  // beaucoup plus fiable pour conserver cette permission.
-  const audioRef = useRef<HTMLAudioElement>(null!);
+
+  // --- Web Audio API ---------------------------------------------------
+  // On abandonne l'élément <audio> et son play() (soumis à des blocages
+  // autoplay intermittents et opaques sur iPad en PWA). À la place :
+  //   - un AudioContext unique, débloqué une fois par un geste utilisateur
+  //     et réveillé (resume) à chaque annonce ;
+  //   - le MP3 est téléchargé en ArrayBuffer, décodé en AudioBuffer (mis en
+  //     cache par cacheKey), puis joué via un AudioBufferSourceNode.
+  // Cette voie n'est pas soumise aux mêmes règles d'autoplay que
+  // HTMLMediaElement.play() et démarre de façon fiable une fois le contexte
+  // débloqué.
+  const audioCtxRef = useRef<AudioContext | null>(null);
+  const bufferCacheRef = useRef<Record<string, AudioBuffer>>({});
+  const currentSourceRef = useRef<AudioBufferSourceNode | null>(null);
+  const isAnnouncingRef = useRef(false);
+  const prefetchedRef = useRef<Record<string, string>>({});
 
   const suggestions =
     prenom.trim().length > 0
@@ -203,8 +182,6 @@ export default function Kiosk() {
     setMounted(true);
     fetch("/api/me").then(async (res) => {
       if (res.status === 403) {
-        // Compte désactivé depuis l'espace agence pendant que la session
-        // était encore valide côté cookie : on déconnecte proprement.
         await fetch("/api/logout", { method: "POST" });
         router.push("/login?raison=desactive");
         return;
@@ -218,8 +195,6 @@ export default function Kiosk() {
     });
   }, [router]);
 
-  // L'historique est propre à chaque client (un même appareil ne sert
-  // qu'un seul compte à la fois, mais on isole quand même par identifiant).
   useEffect(() => {
     if (!clientId) return;
     try {
@@ -230,8 +205,6 @@ export default function Kiosk() {
     }
   }, [clientId]);
 
-  // Sauvegarde l'historique à chaque changement, pour qu'il survive à un
-  // rechargement de page (utile en mode kiosque si l'écran se rafraîchit).
   useEffect(() => {
     if (!clientId) return;
     try {
@@ -249,10 +222,6 @@ export default function Kiosk() {
     return () => clearInterval(id);
   }, []);
 
-  // Tant que le composant n'est pas monté côté client, on force un état
-  // neutre identique à celui du serveur pour éviter tout hydration mismatch.
-  // En mode routines, chaque bouton déclenche l'annonce directement (un
-  // clic) : pas de bouton APPELER à activer/désactiver dans ce mode.
   const canCall =
     mounted &&
     !isLoading &&
@@ -262,60 +231,57 @@ export default function Kiosk() {
       ? Boolean(numero.trim() || prenom.trim() || groupItems.length > 0)
       : false);
 
-  const prefetchedRef = useRef<Record<string, string>>({});
-  const silentUrlRef = useRef<string>("");
-  const audioUnlockedRef = useRef(false);
-  // Verrou synchrone (contrairement à isLoading, mis à jour immédiatement,
-  // sans attendre un re-render React) : évite que deux annonces se
-  // chevauchent sur le même <audio> partagé quand on enchaîne deux appels
-  // très rapprochés (double-tap, ou appel juste après un rejouer).
-  const isAnnouncingRef = useRef(false);
+  // Crée le contexte à la volée et le débloque au tout premier geste. Sur
+  // iOS un AudioContext démarre en état "suspended" et ne peut passer à
+  // "running" que pendant (ou juste après) un geste utilisateur ; une fois
+  // "running", il le reste, et un resume() suffit à le réveiller s'il a été
+  // suspendu par une mise en veille.
+  function ensureAudioContext(): AudioContext | null {
+    if (typeof window === "undefined") return null;
+    if (!audioCtxRef.current) {
+      const Ctor =
+        window.AudioContext ||
+        (window as unknown as { webkitAudioContext?: typeof AudioContext }).webkitAudioContext;
+      if (!Ctor) return null;
+      audioCtxRef.current = new Ctor();
+    }
+    return audioCtxRef.current;
+  }
 
   useEffect(() => {
-    const silent = makeSilentWavUrl();
-    silentUrlRef.current = silent;
-    const audio = audioRef.current;
-    audio.preload = "auto";
-    audio.src = silent;
-
-    // Débloque l'élément <audio> au tout premier contact avec l'écran, une
-    // seule fois. Sur tablette, un <audio> n'a le droit de jouer par la
-    // suite sans geste que s'il a déjà joué au moins une fois PENDANT un
-    // geste utilisateur. On profite donc du premier tap n'importe où (y
-    // compris le tap sur APPELER lui-même) pour l'amorcer.
+    // Débloque le contexte au tout premier contact avec l'écran. On joue
+    // aussi un buffer vide d'un échantillon : sur iOS, cet appel à start()
+    // pendant le geste est ce qui "arme" durablement la sortie audio.
     const unlock = () => {
-      const a = audioRef.current;
-      if (!a || audioUnlockedRef.current) return;
-      a.src = silent;
-      a.play()
-        .then(() => {
-          a.pause();
-          a.currentTime = 0;
-          audioUnlockedRef.current = true;
-          window.removeEventListener("pointerdown", unlock);
-          window.removeEventListener("touchend", unlock);
-        })
-        .catch(() => {});
+      const ctx = ensureAudioContext();
+      if (!ctx) return;
+      const kick = () => {
+        try {
+          const buf = ctx.createBuffer(1, 1, 22050);
+          const src = ctx.createBufferSource();
+          src.buffer = buf;
+          src.connect(ctx.destination);
+          src.start(0);
+        } catch {
+          // sans importance : le resume() ci-dessus est l'essentiel
+        }
+      };
+      if (ctx.state === "suspended") {
+        ctx.resume().then(kick).catch(() => {});
+      } else {
+        kick();
+      }
+      window.removeEventListener("pointerdown", unlock);
+      window.removeEventListener("touchend", unlock);
     };
     window.addEventListener("pointerdown", unlock);
     window.addEventListener("touchend", unlock);
-
     return () => {
       window.removeEventListener("pointerdown", unlock);
       window.removeEventListener("touchend", unlock);
-      URL.revokeObjectURL(silent);
     };
   }, []);
 
-  // Pré-chauffe uniquement les NUMÉROS (ensemble borné 000-999, donc sans
-  // risque : au pire on génère quelques dizaines de fichiers qui resserviront
-  // toujours). Les prénoms et le texte libre ne sont PLUS pré-générés à
-  // chaque pause de frappe : sur un ensemble illimité (n'importe quel
-  // prénom), ça déclenchait un vrai appel ElevenLabs payant pour CHAQUE
-  // pause pendant la saisie ("prenom_e", "prenom_ay", "prenom_aym"...),
-  // gaspillant du quota et déclenchant des 429 qui faisaient ensuite
-  // échouer l'appel réel du prénom complet. Ils sont désormais générés une
-  // seule fois, au moment de l'appui sur APPELER.
   useEffect(() => {
     if (!canCall) return;
     if (mode !== "numero" || prenom.trim() || groupItems.length > 0) return;
@@ -342,9 +308,6 @@ export default function Kiosk() {
     return () => clearTimeout(timer);
   }, [numero, prenom, texteLibre, canCall, mode, groupItems.length]);
 
-  // Le "+" côté du champ prénom empile jusqu'à 3 identifiants (prénom ou
-  // numéro) pour une annonce groupée ; currentEntry() lit ce qui est
-  // actuellement tapé, sans encore l'ajouter au groupe.
   function currentEntry(): GroupEntry | null {
     if (prenom.trim()) {
       const raw = prenom.trim();
@@ -382,32 +345,66 @@ export default function Kiosk() {
     setGroupItems((g) => g.filter((_, i) => i !== index));
   }
 
+  // Récupère l'AudioBuffer décodé pour une URL donnée (cache par cacheKey).
+  async function loadBuffer(url: string, cacheKey: string, ctx: AudioContext): Promise<AudioBuffer> {
+    const cached = bufferCacheRef.current[cacheKey];
+    if (cached) return cached;
+    const res = await fetch(url);
+    if (!res.ok) throw new Error(`Téléchargement audio échoué (${res.status})`);
+    const arrayBuf = await res.arrayBuffer();
+    // decodeAudioData en version Promise ; certains vieux WebKit ne
+    // supportent que la forme callback, d'où le fallback.
+    const buffer = await new Promise<AudioBuffer>((resolve, reject) => {
+      const p = ctx.decodeAudioData(arrayBuf, resolve, reject);
+      if (p && typeof p.then === "function") p.then(resolve, reject);
+    });
+    bufferCacheRef.current[cacheKey] = buffer;
+    return buffer;
+  }
+
+  function playBuffer(buffer: AudioBuffer, ctx: AudioContext) {
+    // On coupe une éventuelle lecture en cours avant d'en démarrer une autre.
+    if (currentSourceRef.current) {
+      try {
+        currentSourceRef.current.stop();
+      } catch {
+        // déjà arrêtée
+      }
+      currentSourceRef.current = null;
+    }
+    const src = ctx.createBufferSource();
+    src.buffer = buffer;
+    src.connect(ctx.destination);
+    src.onended = () => {
+      if (currentSourceRef.current === src) currentSourceRef.current = null;
+    };
+    src.start(0);
+    currentSourceRef.current = src;
+  }
+
   async function announce(text: string, cacheKey: string, label: string): Promise<boolean> {
-    // isLoading seul ne suffit pas : c'est un state React, mis à jour de
-    // façon asynchrone, donc deux appels déclenchés à quelques millisecondes
-    // d'écart (double-tap sur tablette) peuvent tous les deux le lire à
-    // `false` et démarrer en même temps sur le même élément <audio>.
     if (isAnnouncingRef.current) return false;
     isAnnouncingRef.current = true;
 
     setError(null);
     setIsLoading(true);
 
-    const audio = audioRef.current;
-
-    // Priming systématique : on remet la source sur un silence VALIDE et on
-    // le laisse tourner en boucle. Tant que la génération ElevenLabs d'un
-    // prénom jamais appelé est en cours (plus lente qu'un cache hit),
-    // l'élément reste réellement en lecture — le play() du vrai fichier qui
-    // suit est alors traité comme la continuation d'une lecture en cours et
-    // non comme un nouvel autoplay sans geste, que le navigateur bloquerait.
-    audio.loop = true;
-    audio.src = silentUrlRef.current;
-    try {
-      await audio.play();
-    } catch {
-      // on continue quand même : le retry sur le vrai fichier gère l'échec
+    const ctx = ensureAudioContext();
+    if (!ctx) {
+      setError("Audio non supporté sur ce navigateur.");
+      setIsLoading(false);
+      isAnnouncingRef.current = false;
+      return false;
     }
+
+    // On réveille le contexte de façon synchrone dans le geste (le clic qui
+    // a déclenché announce). C'est le point clé sur iPad.
+    try {
+      if (ctx.state === "suspended") await ctx.resume();
+    } catch {
+      // on tente quand même la suite
+    }
+    setDebug(`ctx=${ctx.state}`);
 
     try {
       const cached = prefetchedRef.current[cacheKey];
@@ -424,20 +421,10 @@ export default function Kiosk() {
         if (!res.ok) throw new Error(data.error ?? "Erreur inconnue");
         url = data.url;
       }
-      audio.loop = false;
-      audio.src = url;
-      try {
-        await audio.play();
-      } catch {
-        // Un premier échec juste après un changement de src est fréquent sur
-        // tablette : on laisse le navigateur souffler et on retente une fois.
-        await new Promise((r) => setTimeout(r, 150));
-        try {
-          await audio.play();
-        } catch {
-          setError("Le son n'a pas pu démarrer — réessaie ou rejoue-le depuis l'historique.");
-        }
-      }
+
+      const buffer = await loadBuffer(url, cacheKey, ctx);
+      setDebug(`ctx=${ctx.state} buffer=${buffer.duration.toFixed(2)}s`);
+      playBuffer(buffer, ctx);
 
       setHistory((prev) => [
         {
@@ -451,7 +438,9 @@ export default function Kiosk() {
       ].slice(0, 12));
       return true;
     } catch (err) {
-      setError(err instanceof Error ? err.message : "Échec de l'annonce");
+      const msg = err instanceof Error ? err.message : "Échec de l'annonce";
+      setError(msg);
+      setDebug(`ERREUR: ${msg} (ctx=${ctx.state})`);
       return false;
     } finally {
       setIsLoading(false);
@@ -459,9 +448,6 @@ export default function Kiosk() {
     }
   }
 
-  // Un prénom tapé qui n'est ni dans la liste suggérée ni déjà appris est
-  // enregistré silencieusement pour ce client : il sera suggéré la
-  // prochaine fois. Appelé seulement après une annonce réussie.
   async function learnNameIfNew(name: string) {
     const trimmed = name.trim();
     if (!trimmed) return;
@@ -493,8 +479,6 @@ export default function Kiosk() {
       return;
     }
 
-    // Mode numéro/prénom : on inclut ce qui est encore tapé (non ajouté via
-    // le "+") comme dernier élément du groupe, dans la limite de 3.
     const current = currentEntry();
     const entries =
       groupItems.length >= 3 ? groupItems : [...groupItems, ...(current ? [current] : [])];
@@ -518,18 +502,15 @@ export default function Kiosk() {
   }
 
   async function handleReplay(ticket: Ticket) {
-    // Même verrou que announce() : on ne coupe pas une annonce en cours en
-    // rejouant l'historique par-dessus le même <audio> partagé.
     if (isAnnouncingRef.current) return;
     isAnnouncingRef.current = true;
     setError(null);
     try {
-      // Le fichier est déjà généré et mis en cache côté serveur : on le
-      // rejoue directement, aucun appel à l'API ElevenLabs n'est fait.
-      const audio = audioRef.current;
-      audio.loop = false;
-      audio.src = ticket.url;
-      await audio.play();
+      const ctx = ensureAudioContext();
+      if (!ctx) throw new Error("Audio non supporté.");
+      if (ctx.state === "suspended") await ctx.resume();
+      const buffer = await loadBuffer(ticket.url, `replay_${ticket.id}`, ctx);
+      playBuffer(buffer, ctx);
     } catch {
       setError("Impossible de rejouer cette annonce.");
     } finally {
@@ -550,7 +531,6 @@ export default function Kiosk() {
 
   return (
     <main style={styles.main}>
-      <audio ref={audioRef} playsInline style={{ display: "none" }} />
       <header style={styles.header}>
         <span style={styles.eyebrow}>
           {(restaurantName || "…").toUpperCase()} · COMPTOIR
@@ -748,6 +728,7 @@ export default function Kiosk() {
           )}
 
           {error && <p style={styles.error}>{error}</p>}
+          {debug && <p style={styles.debug}>{debug}</p>}
           {wakeLockSupported && !wakeLockActive && (
             <p style={styles.hint}>Écran non verrouillé actif — touchez l'écran pour réactiver.</p>
           )}
@@ -1043,6 +1024,13 @@ const styles: Record<string, React.CSSProperties> = {
     color: "#d97757",
     fontSize: 14,
     textAlign: "center",
+  },
+  debug: {
+    color: "var(--text-muted)",
+    fontSize: 11,
+    fontFamily: "monospace",
+    textAlign: "center",
+    opacity: 0.7,
   },
   hint: {
     color: "var(--text-muted)",
