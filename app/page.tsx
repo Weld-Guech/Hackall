@@ -24,6 +24,8 @@ type Routine = {
 type Mode = "numero" | "libre" | "routines";
 
 const MAX_SUGGESTIONS = 6;
+// Doit rester identique à AUDIO_CACHE dans public/sw.js.
+const AUDIO_CACHE = "appelresto-audio-v3";
 
 // Convertit un nombre (0-999) en toutes lettres françaises, pour éviter
 // que le TTS ne lise les chiffres un par un sur les nombres composés
@@ -158,7 +160,10 @@ export default function Kiosk() {
   const audioCtxRef = useRef<AudioContext | null>(null);
   const bufferCacheRef = useRef<Record<string, AudioBuffer>>({});
   const currentSourceRef = useRef<AudioBufferSourceNode | null>(null);
-  const isAnnouncingRef = useRef(false);
+  // File de lecture unique : chaque annonce attend la fin de la précédente
+  // au lieu de la couper (ou d'être ignorée). Le téléchargement, lui, démarre
+  // tout de suite, en parallèle de la lecture en cours.
+  const playQueueRef = useRef<Promise<void>>(Promise.resolve());
   const prefetchedRef = useRef<Record<string, string>>({});
 
   const suggestions =
@@ -345,46 +350,119 @@ export default function Kiosk() {
     setGroupItems((g) => g.filter((_, i) => i !== index));
   }
 
+  function decode(arrayBuf: ArrayBuffer, ctx: AudioContext): Promise<AudioBuffer> {
+    // decodeAudioData en version Promise ; certains vieux WebKit ne
+    // supportent que la forme callback, d'où le fallback.
+    return new Promise<AudioBuffer>((resolve, reject) => {
+      const p = ctx.decodeAudioData(arrayBuf, resolve, reject);
+      if (p && typeof p.then === "function") p.then(resolve, reject);
+    });
+  }
+
   // Récupère l'AudioBuffer décodé pour une URL donnée (cache par cacheKey).
   async function loadBuffer(url: string, cacheKey: string, ctx: AudioContext): Promise<AudioBuffer> {
     const cached = bufferCacheRef.current[cacheKey];
     if (cached) return cached;
     const res = await fetch(url);
     if (!res.ok) throw new Error(`Téléchargement audio échoué (${res.status})`);
-    const arrayBuf = await res.arrayBuffer();
-    // decodeAudioData en version Promise ; certains vieux WebKit ne
-    // supportent que la forme callback, d'où le fallback.
-    const buffer = await new Promise<AudioBuffer>((resolve, reject) => {
-      const p = ctx.decodeAudioData(arrayBuf, resolve, reject);
-      if (p && typeof p.then === "function") p.then(resolve, reject);
-    });
+    const buffer = await decode(await res.arrayBuffer(), ctx);
     bufferCacheRef.current[cacheKey] = buffer;
     return buffer;
   }
 
-  function playBuffer(buffer: AudioBuffer, ctx: AudioContext) {
-    // On coupe une éventuelle lecture en cours avant d'en démarrer une autre.
-    if (currentSourceRef.current) {
-      try {
-        currentSourceRef.current.stop();
-      } catch {
-        // déjà arrêtée
-      }
-      currentSourceRef.current = null;
+  // Une seule requête : le serveur renvoie directement le MP3 (en streaming
+  // s'il est en cours de génération) au lieu d'une URL à retélécharger.
+  async function fetchAnnouncement(
+    text: string,
+    cacheKey: string,
+    ctx: AudioContext,
+    marks: Record<string, number>
+  ): Promise<{ buffer: AudioBuffer; url: string; cache: string }> {
+    const cached = bufferCacheRef.current[cacheKey];
+    const prefetchedUrl = prefetchedRef.current[cacheKey];
+    if (cached && prefetchedUrl) return { buffer: cached, url: prefetchedUrl, cache: "memory" };
+    if (prefetchedUrl) {
+      const buffer = await loadBuffer(prefetchedUrl, cacheKey, ctx);
+      marks.downloaded = performance.now();
+      return { buffer, url: prefetchedUrl, cache: "prefetch" };
     }
-    const src = ctx.createBufferSource();
-    src.buffer = buffer;
-    src.connect(ctx.destination);
-    src.onended = () => {
-      if (currentSourceRef.current === src) currentSourceRef.current = null;
-    };
-    src.start(0);
-    currentSourceRef.current = src;
+
+    const res = await fetch("/api/tts", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Accept: "audio/mpeg" },
+      body: JSON.stringify({ text, cacheKey }),
+    });
+    marks.headers = performance.now();
+    if (!res.ok) {
+      const data = await res.json().catch(() => ({}));
+      throw new Error(data.error ?? `Erreur serveur (${res.status})`);
+    }
+    const url = res.headers.get("X-Audio-Url") ?? "";
+    const cache = res.headers.get("X-Cache") ?? "?";
+    const arrayBuf = await res.arrayBuffer();
+    marks.downloaded = performance.now();
+
+    // Copie dans le cache du service worker pour que l'annonce reste
+    // rejouable hors ligne (le POST, lui, n'est jamais mis en cache).
+    if (url && "caches" in window) {
+      caches
+        .open(AUDIO_CACHE)
+        .then((c) =>
+          c.put(url, new Response(arrayBuf.slice(0), { headers: { "Content-Type": "audio/mpeg" } }))
+        )
+        .catch(() => {});
+    }
+
+    const buffer = await decode(arrayBuf, ctx);
+    marks.decoded = performance.now();
+    bufferCacheRef.current[cacheKey] = buffer;
+    if (url) prefetchedRef.current[cacheKey] = url;
+    return { buffer, url, cache };
+  }
+
+  // Joue un buffer et se résout à la fin de la lecture. Filet de sécurité :
+  // si "onended" ne se déclenche jamais (contexte suspendu par iOS), on libère
+  // la file après la durée du son + 1 s pour ne pas bloquer les annonces.
+  function playBuffer(buffer: AudioBuffer, ctx: AudioContext): Promise<void> {
+    return new Promise((resolve) => {
+      const src = ctx.createBufferSource();
+      src.buffer = buffer;
+      src.connect(ctx.destination);
+      const finish = () => {
+        clearTimeout(guard);
+        if (currentSourceRef.current === src) currentSourceRef.current = null;
+        resolve();
+      };
+      const guard = setTimeout(finish, buffer.duration * 1000 + 1000);
+      src.onended = finish;
+      src.start(0);
+      currentSourceRef.current = src;
+    });
+  }
+
+  // Ajoute une lecture à la file : elle démarre dès que la précédente est
+  // terminée et que son propre buffer est prêt, dans l'ordre des clics.
+  function enqueuePlayback(
+    bufferPromise: Promise<AudioBuffer>,
+    ctx: AudioContext,
+    onStart?: () => void
+  ): Promise<void> {
+    const previous = playQueueRef.current;
+    const mine = (async () => {
+      const buffer = await bufferPromise;
+      await previous;
+      if (ctx.state === "suspended") await ctx.resume().catch(() => {});
+      onStart?.();
+      await playBuffer(buffer, ctx);
+    })();
+    playQueueRef.current = mine.catch(() => {});
+    return mine;
   }
 
   async function announce(text: string, cacheKey: string, label: string): Promise<boolean> {
-    if (isAnnouncingRef.current) return false;
-    isAnnouncingRef.current = true;
+    // Mesures de latence (console + ligne de debug à l'écran) :
+    // clic → en-têtes serveur → MP3 reçu → décodé → premier son.
+    const marks: Record<string, number> = { clicked: performance.now() };
 
     setError(null);
     setIsLoading(true);
@@ -393,7 +471,6 @@ export default function Kiosk() {
     if (!ctx) {
       setError("Audio non supporté sur ce navigateur.");
       setIsLoading(false);
-      isAnnouncingRef.current = false;
       return false;
     }
 
@@ -406,26 +483,38 @@ export default function Kiosk() {
     }
     setDebug(`ctx=${ctx.state}`);
 
-    try {
-      const cached = prefetchedRef.current[cacheKey];
-      let url: string;
-      if (cached) {
-        url = cached;
-      } else {
-        const res = await fetch("/api/tts", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ text, cacheKey }),
+    const ms = (k: string) => (marks[k] ? Math.round(marks[k] - marks.clicked) : null);
+
+    // La place dans la file est réservée dès le clic, pendant que le
+    // téléchargement tourne : l'ordre des annonces suit l'ordre des clics.
+    const fetching = fetchAnnouncement(text, cacheKey, ctx, marks);
+    enqueuePlayback(
+      fetching.then((r) => r.buffer),
+      ctx,
+      () => {
+        marks.played = performance.now();
+        fetching.then(({ buffer, cache }) => {
+          const metrics = {
+            cache,
+            headers_ms: ms("headers"),
+            downloaded_ms: ms("downloaded"),
+            decoded_ms: ms("decoded"),
+            first_sound_ms: ms("played"),
+            duration_s: Number(buffer.duration.toFixed(2)),
+          };
+          console.info("[annonce]", metrics);
+          setDebug(
+            `ctx=${ctx.state} ${cache} · premier son ${metrics.first_sound_ms} ms (attente file incluse)`
+          );
         });
-        const data = await res.json();
-        if (!res.ok) throw new Error(data.error ?? "Erreur inconnue");
-        url = data.url;
       }
+    ).catch(() => {
+      // L'échec du téléchargement est déjà affiché ci-dessous.
+    });
 
-      const buffer = await loadBuffer(url, cacheKey, ctx);
-      setDebug(`ctx=${ctx.state} buffer=${buffer.duration.toFixed(2)}s`);
-      playBuffer(buffer, ctx);
-
+    try {
+      const { url } = await fetching;
+      marks.decoded = marks.decoded ?? performance.now();
       setHistory((prev) => [
         {
           id: `${Date.now()}`,
@@ -444,7 +533,6 @@ export default function Kiosk() {
       return false;
     } finally {
       setIsLoading(false);
-      isAnnouncingRef.current = false;
     }
   }
 
@@ -502,19 +590,14 @@ export default function Kiosk() {
   }
 
   async function handleReplay(ticket: Ticket) {
-    if (isAnnouncingRef.current) return;
-    isAnnouncingRef.current = true;
     setError(null);
     try {
       const ctx = ensureAudioContext();
       if (!ctx) throw new Error("Audio non supporté.");
       if (ctx.state === "suspended") await ctx.resume();
-      const buffer = await loadBuffer(ticket.url, `replay_${ticket.id}`, ctx);
-      playBuffer(buffer, ctx);
+      await enqueuePlayback(loadBuffer(ticket.url, `replay_${ticket.id}`, ctx), ctx);
     } catch {
       setError("Impossible de rejouer cette annonce.");
-    } finally {
-      isAnnouncingRef.current = false;
     }
   }
 

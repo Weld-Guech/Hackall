@@ -1,5 +1,6 @@
-const AUDIO_CACHE = "appelresto-audio-v2";
-const APP_SHELL_CACHE = "appelresto-shell-v2";
+// AUDIO_CACHE doit rester identique à la constante de app/page.tsx.
+const AUDIO_CACHE = "appelresto-audio-v3";
+const APP_SHELL_CACHE = "appelresto-shell-v3";
 
 self.addEventListener("install", () => {
   self.skipWaiting();
@@ -26,23 +27,18 @@ self.addEventListener("fetch", (event) => {
   // Jamais d'interception des appels API : toujours le reseau
   if (url.pathname.startsWith("/api/")) return;
 
-  // Audio genere : reseau d'abord, cache local uniquement si la
-  // reponse est valide, repli sur le cache si le wifi tombe
+  // Audio genere : cache d'abord. Un fichier genere ne change jamais
+  // (servi en "immutable"), donc inutile de repasser par le reseau a
+  // chaque lecture ; on ne met en cache que les reponses valides.
   if (url.pathname.startsWith("/audio/generated/")) {
     event.respondWith(
       (async () => {
-        try {
-          const response = await fetch(event.request);
-          if (response.ok) {
-            const cache = await caches.open(AUDIO_CACHE);
-            cache.put(event.request, response.clone());
-          }
-          return response;
-        } catch {
-          const cached = await caches.match(event.request);
-          if (cached) return cached;
-          throw new Error("Hors ligne et audio absent du cache");
-        }
+        const cache = await caches.open(AUDIO_CACHE);
+        const cached = await cache.match(event.request);
+        if (cached) return cached;
+        const response = await fetch(event.request);
+        if (response.ok) cache.put(event.request, response.clone());
+        return response;
       })()
     );
     return;
