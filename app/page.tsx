@@ -6,6 +6,7 @@ import { useWakeLock } from "@/hooks/useWakeLock";
 import { PRENOMS_ARABES } from "@/lib/prenomsArabes";
 import { PHONETIC_MAP } from "@/lib/phoneticCorrections";
 import { normalizeName } from "@/lib/normalizeName";
+import { playbackGuardMs, resumeWithTimeout } from "@/lib/audioPlayback";
 
 type Ticket = {
   id: string;
@@ -351,11 +352,14 @@ export default function Kiosk() {
   }
 
   function decode(arrayBuf: ArrayBuffer, ctx: AudioContext): Promise<AudioBuffer> {
-    // decodeAudioData en version Promise ; certains vieux WebKit ne
-    // supportent que la forme callback, d'où le fallback.
+    // Copie avant décodage : decodeAudioData détache (neuter) l'ArrayBuffer.
+    // On n'utilise qu'une seule API (promesse OU callback) sur cette copie :
+    // les deux à la fois faisaient échouer le 2e passage une fois le buffer détaché.
+    const copy = arrayBuf.slice(0);
+    const p = ctx.decodeAudioData(copy);
+    if (p && typeof p.then === "function") return p;
     return new Promise<AudioBuffer>((resolve, reject) => {
-      const p = ctx.decodeAudioData(arrayBuf, resolve, reject);
-      if (p && typeof p.then === "function") p.then(resolve, reject);
+      ctx.decodeAudioData(arrayBuf.slice(0), resolve, reject);
     });
   }
 
@@ -402,13 +406,14 @@ export default function Kiosk() {
     const arrayBuf = await res.arrayBuffer();
     marks.downloaded = performance.now();
 
-    // Copie dans le cache du service worker pour que l'annonce reste
-    // rejouable hors ligne (le POST, lui, n'est jamais mis en cache).
+    // Copie synchrone avant decodeAudioData, qui détache arrayBuf.
+    // Le caches.open() est async : slicer dans son then() arrive trop tard.
+    const mpegForCache = arrayBuf.slice(0);
     if (url && "caches" in window) {
       caches
         .open(AUDIO_CACHE)
         .then((c) =>
-          c.put(url, new Response(arrayBuf.slice(0), { headers: { "Content-Type": "audio/mpeg" } }))
+          c.put(url, new Response(mpegForCache, { headers: { "Content-Type": "audio/mpeg" } }))
         )
         .catch(() => {});
     }
@@ -422,21 +427,57 @@ export default function Kiosk() {
 
   // Joue un buffer et se résout à la fin de la lecture. Filet de sécurité :
   // si "onended" ne se déclenche jamais (contexte suspendu par iOS), on libère
-  // la file après la durée du son + 1 s pour ne pas bloquer les annonces.
+  // la file après un délai plafonné — sans plafond, duration === Infinity
+  // bloque toutes les annonces suivantes (historique OK, silence).
   function playBuffer(buffer: AudioBuffer, ctx: AudioContext): Promise<void> {
     return new Promise((resolve) => {
-      const src = ctx.createBufferSource();
-      src.buffer = buffer;
-      src.connect(ctx.destination);
+      let settled = false;
+      let src: AudioBufferSourceNode | null = null;
+      let guard = 0;
+
       const finish = () => {
+        if (settled) return;
+        settled = true;
         clearTimeout(guard);
+        if (src) {
+          try {
+            src.stop();
+          } catch {
+            // déjà arrêté
+          }
+          try {
+            src.disconnect();
+          } catch {
+            // déjà déconnecté
+          }
+        }
         if (currentSourceRef.current === src) currentSourceRef.current = null;
         resolve();
       };
-      const guard = setTimeout(finish, buffer.duration * 1000 + 1000);
-      src.onended = finish;
-      src.start(0);
-      currentSourceRef.current = src;
+
+      try {
+        if (currentSourceRef.current) {
+          try {
+            currentSourceRef.current.stop();
+          } catch {
+            // source précédente déjà terminée
+          }
+          try {
+            currentSourceRef.current.disconnect();
+          } catch {
+            // déjà déconnectée
+          }
+        }
+        src = ctx.createBufferSource();
+        src.buffer = buffer;
+        src.connect(ctx.destination);
+        guard = window.setTimeout(finish, playbackGuardMs(buffer.duration));
+        src.onended = finish;
+        src.start();
+        currentSourceRef.current = src;
+      } catch {
+        finish();
+      }
     });
   }
 
@@ -451,7 +492,9 @@ export default function Kiosk() {
     const mine = (async () => {
       const buffer = await bufferPromise;
       await previous;
-      if (ctx.state === "suspended") await ctx.resume().catch(() => {});
+      if (ctx.state === "suspended") {
+        await resumeWithTimeout(() => ctx.resume());
+      }
       onStart?.();
       await playBuffer(buffer, ctx);
     })();
@@ -477,7 +520,7 @@ export default function Kiosk() {
     // On réveille le contexte de façon synchrone dans le geste (le clic qui
     // a déclenché announce). C'est le point clé sur iPad.
     try {
-      if (ctx.state === "suspended") await ctx.resume();
+      if (ctx.state === "suspended") await resumeWithTimeout(() => ctx.resume());
     } catch {
       // on tente quand même la suite
     }

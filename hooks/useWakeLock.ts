@@ -1,6 +1,7 @@
 "use client";
 
 import { useEffect, useRef, useState } from "react";
+import { shouldReacquireWakeLock } from "@/lib/wakeLockPolicy";
 
 /**
  * Empêche l'écran de s'éteindre pendant que l'app tourne en mode
@@ -21,9 +22,13 @@ export function useWakeLock() {
 
     const requestLock = async () => {
       try {
-        wakeLockRef.current = await navigator.wakeLock.request("screen");
+        const sentinel = await navigator.wakeLock.request("screen");
+        wakeLockRef.current = sentinel;
         setActive(true);
-        wakeLockRef.current.addEventListener("release", () => setActive(false));
+        sentinel.addEventListener("release", () => {
+          setActive(false);
+          if (wakeLockRef.current === sentinel) wakeLockRef.current = null;
+        });
       } catch {
         setActive(false);
       }
@@ -32,7 +37,7 @@ export function useWakeLock() {
     requestLock();
 
     const onVisibilityChange = () => {
-      if (document.visibilityState === "visible" && !wakeLockRef.current) {
+      if (shouldReacquireWakeLock(document.visibilityState, wakeLockRef.current)) {
         requestLock();
       }
     };
