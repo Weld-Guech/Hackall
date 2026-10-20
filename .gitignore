@@ -4,3 +4,4 @@ node_modules
 public/audio/generated
 data
 audio-cache
+tts-cache
