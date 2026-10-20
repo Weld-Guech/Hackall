@@ -7,6 +7,7 @@ import { PRENOMS_ARABES } from "@/lib/prenomsArabes";
 import { normalizeName } from "@/lib/normalizeName";
 import { resumeWithTimeout } from "@/lib/audioPlayback";
 import { SegmentPlayer, type LoadedPart } from "@/lib/audio/segmentPlayer";
+import { syncOfflineAudio, type SyncProgress } from "@/lib/audio/offlineSync";
 import { shortHash } from "@/lib/tts/text";
 import {
   buildIdsAnnouncement,
@@ -87,6 +88,10 @@ export default function Kiosk() {
   // au lieu de la couper (ou d'être ignorée). Le téléchargement, lui, démarre
   // tout de suite, en parallèle de la lecture en cours.
   const playQueueRef = useRef<Promise<void>>(Promise.resolve());
+  // Annonces en cours de chargement : le téléchargement hors-ligne se met
+  // en pause pour leur laisser la bande passante.
+  const announcingRef = useRef(0);
+  const [offlineSync, setOfflineSync] = useState<SyncProgress | null>(null);
 
   const suggestions =
     prenom.trim().length > 0
@@ -215,6 +220,40 @@ export default function Kiosk() {
     });
   }, [serviceStarted, voiceTag]);
 
+  // Télécharge sur la tablette tous les segments déjà générés, au démarrage
+  // puis toutes les 30 minutes (nouveaux prénoms) et au retour du réseau.
+  useEffect(() => {
+    if (!serviceStarted || voiceTag === null) return;
+    let stopped = false;
+    let running = false;
+    const run = async () => {
+      if (running || stopped) return;
+      running = true;
+      try {
+        await syncOfflineAudio({
+          voiceTag,
+          isBusy: () => announcingRef.current > 0,
+          shouldStop: () => stopped,
+          onProgress: (p) => {
+            if (!stopped) setOfflineSync(p);
+          },
+        });
+      } catch {
+        // best-effort : n'empêche jamais d'annoncer
+      } finally {
+        running = false;
+      }
+    };
+    void run();
+    const timer = window.setInterval(run, 30 * 60 * 1000);
+    window.addEventListener("online", run);
+    return () => {
+      stopped = true;
+      window.clearInterval(timer);
+      window.removeEventListener("online", run);
+    };
+  }, [serviceStarted, voiceTag]);
+
   // Précharge le segment d'un numéro pendant la saisie (les prénoms ne sont
   // préchargés qu'une fois choisis dans les suggestions : précharger "Ray",
   // "Raya"... déclencherait des générations inutiles).
@@ -319,6 +358,12 @@ export default function Kiosk() {
     // La place dans la file est réservée dès le clic, pendant que le
     // téléchargement tourne : l'ordre des annonces suit l'ordre des clics.
     const loading = loadAnnouncement(player, a);
+    announcingRef.current++;
+    loading
+      .catch(() => {})
+      .finally(() => {
+        announcingRef.current--;
+      });
     enqueuePlayback(
       player,
       loading.then((l) => l.parts),
@@ -660,6 +705,15 @@ export default function Kiosk() {
 
           {error && <p style={styles.error}>{error}</p>}
           {debug && <p style={styles.debug}>{debug}</p>}
+          {offlineSync && offlineSync.state !== "unsupported" && offlineSync.total > 0 && (
+            <p style={styles.hint}>
+              {offlineSync.state === "running"
+                ? `Sons hors-ligne : ${offlineSync.done} / ${offlineSync.total}`
+                : offlineSync.state === "offline"
+                ? `Sons hors-ligne : ${offlineSync.done} / ${offlineSync.total} (en pause, pas de réseau)`
+                : `Sons hors-ligne : prêts ✓ (${offlineSync.done})`}
+            </p>
+          )}
           {wakeLockSupported && !wakeLockActive && (
             <p style={styles.hint}>Écran non verrouillé actif — touchez l'écran pour réactiver.</p>
           )}

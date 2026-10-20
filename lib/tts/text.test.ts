@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { FIXED, canonicalName, resolveSegment, ttsUrl } from "./text.ts";
+import { FIXED, TTS_PIPELINE_VERSION, canonicalName, resolveSegment, shortHash, urlFor } from "./text.ts";
 import { buildIdsAnnouncement, buildLibreAnnouncement } from "./segments.ts";
 
 test("un numéro est prononcé en lettres et normalisé (007 et 7 : même segment)", () => {
@@ -56,10 +56,17 @@ test("le contexte d'intonation est fourni pour les segments fixes et les identif
   assert.equal(libre.previous, undefined);
 });
 
+test("la version d'URL dépend du texte prononcé du segment, pas de toute la table", () => {
+  const v = (url: string | null) => new URL(url ?? "", "http://x").searchParams.get("v");
+  assert.equal(v(urlFor("7", "id", "t")), `${TTS_PIPELINE_VERSION}.${shortHash("sept")}.t`);
+  assert.equal(v(urlFor("Ayoub", "id", "")), `${TTS_PIPELINE_VERSION}.${shortHash("Aïoub")}`);
+  assert.equal(urlFor("<b>", "id", ""), null);
+});
+
 test("annonce simple : 3 segments et phrase complète pour Piper", () => {
   const a = buildIdsAnnouncement([{ raw: "rayane", label: "rayane" }], "t");
   assert.equal(a.parts.length, 3);
-  assert.deepEqual(a.parts[1], { url: ttsUrl("Rayane", "id", "t") });
+  assert.deepEqual(a.parts[1], { url: urlFor("rAyAnE", "id", "t") });
   assert.equal(a.text, "La commande Raïane est prête.");
   assert.equal(a.piperText, a.text);
 });

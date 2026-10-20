@@ -9,6 +9,7 @@
 //   final/ab/<clé>.mp3        voix ElevenLabs, servie en "immutable"
 //   provisoire/<clé>.mp3      secours Piper, à régénérer plus tard
 //   provisoire/<clé>.json     ce qu'il faut pour régénérer (segment, voix)
+//   final/index.jsonl         segments générés (pour le téléchargement hors-ligne)
 //   piper/ab/<clé>.mp3        phrases complètes lues par Piper (secours)
 //   logs/nouveaux-prenoms.jsonl
 import fs from "fs";
@@ -17,7 +18,7 @@ import os from "os";
 import path from "path";
 import crypto from "crypto";
 import { spawn } from "child_process";
-import type { ResolvedSegment } from "./text.ts";
+import { resolveSegment, type ResolvedSegment, type TtsCtx } from "./text.ts";
 
 export const TTS_CACHE_DIR = process.env.TTS_CACHE_DIR || path.join(process.cwd(), "tts-cache");
 
@@ -57,7 +58,7 @@ export type TtsResult = { audio: Buffer; final: boolean; source: TtsSource };
 
 export class TtsError extends Error {
   status: number;
-  code: "quota" | "upstream" | "config" | "piper";
+  code: "quota" | "upstream" | "config" | "piper" | "absent";
   constructor(message: string, status: number, code: TtsError["code"]) {
     super(message);
     this.status = status;
@@ -244,6 +245,7 @@ function generateFinal(key: string, voiceId: string, r: ResolvedSegment): Promis
     // La vraie voix remplace le secours Piper éventuel.
     await fsp.rm(paths.provisoire, { force: true });
     await fsp.rm(paths.meta, { force: true });
+    await appendToIndex(r, voiceId);
     logTts({ evt: "generated", key: key.slice(0, 10), kind: r.kind, ms: Date.now() - t0, bytes: audio.length });
     return audio;
   })();
@@ -253,6 +255,73 @@ function generateFinal(key: string, voiceId: string, r: ResolvedSegment): Promis
     .catch((err) => logTts({ evt: "eleven_error", key: key.slice(0, 10), message: String(err).slice(0, 300) }))
     .finally(() => elevenInFlight.delete(key));
   return job;
+}
+
+// --- Index des segments générés ----------------------------------------------
+// Une ligne par segment ElevenLabs enregistré, pour que le téléchargement
+// hors-ligne retrouve aussi les prénoms appris en service ou passés au script
+// avec --prenoms (le nom d'un fichier n'est qu'un hash, illisible). Les
+// textes libres n'y figurent pas : ils sont propres à chaque restaurant.
+
+const INDEX_FILE = path.join(TTS_CACHE_DIR, "final", "index.jsonl");
+
+type IndexEntry = { seg: string; ctx: TtsCtx; voiceId: string };
+
+async function appendToIndex(r: ResolvedSegment, voiceId: string) {
+  if (r.ctx === "libre") return;
+  const entry: IndexEntry = { seg: r.input, ctx: r.ctx, voiceId };
+  try {
+    await fsp.mkdir(path.dirname(INDEX_FILE), { recursive: true });
+    await fsp.appendFile(INDEX_FILE, `${JSON.stringify(entry)}\n`);
+  } catch (err) {
+    logTts({ evt: "index_error", message: String(err) });
+  }
+}
+
+let indexCache: { mtimeMs: number; size: number; entries: IndexEntry[] } | null = null;
+
+async function readIndex(): Promise<IndexEntry[]> {
+  let stat: fs.Stats;
+  try {
+    stat = await fsp.stat(INDEX_FILE);
+  } catch {
+    return [];
+  }
+  if (indexCache && indexCache.mtimeMs === stat.mtimeMs && indexCache.size === stat.size) {
+    return indexCache.entries;
+  }
+  const entries: IndexEntry[] = [];
+  for (const line of (await fsp.readFile(INDEX_FILE, "utf8")).split("\n")) {
+    try {
+      if (line) entries.push(JSON.parse(line));
+    } catch {
+      // ligne tronquée (arrêt brutal pendant l'écriture) : ignorée
+    }
+  }
+  indexCache = { mtimeMs: stat.mtimeMs, size: stat.size, entries };
+  return entries;
+}
+
+// Segments disponibles en version définitive pour une voix : les candidats
+// fournis (numéros, prénoms connus, routines du restaurant) plus tout ce qui
+// a été généré pour cette voix. Seuls les fichiers réellement présents sont
+// renvoyés : le téléchargement hors-ligne ne déclenche jamais de génération.
+export async function listCachedSegments(
+  voiceId: string,
+  candidates: { seg: string; ctx: TtsCtx }[]
+): Promise<{ seg: string; ctx: TtsCtx }[]> {
+  const indexed = (await readIndex()).filter((e) => e.voiceId === voiceId);
+  const seen = new Set<string>();
+  const out: { seg: string; ctx: TtsCtx }[] = [];
+  for (const c of [...candidates, ...indexed]) {
+    const r = resolveSegment(c.seg, c.ctx);
+    if (!r.ok) continue;
+    const id = `${r.ctx}|${r.input}`;
+    if (seen.has(id)) continue;
+    seen.add(id);
+    if (hasFinalSegment(r, voiceId)) out.push({ seg: r.input, ctx: r.ctx });
+  }
+  return out;
 }
 
 // --- Piper (secours local) --------------------------------------------------
@@ -338,7 +407,7 @@ export function hasFinalSegment(r: ResolvedSegment, voiceId: string): boolean {
 
 export async function getSegmentAudio(
   r: ResolvedSegment,
-  opts: { voiceId: string; batch: boolean; client: string }
+  opts: { voiceId: string; batch: boolean; client: string; cacheOnly?: boolean }
 ): Promise<TtsResult> {
   const key = segmentKey(opts.voiceId, r);
   const paths = segmentPaths(key);
@@ -353,6 +422,9 @@ export async function getSegmentAudio(
     }
     return { audio: cached, final: true, source: "cache" };
   }
+
+  // Téléchargement hors-ligne des tablettes : jamais de génération.
+  if (opts.cacheOnly) throw new TtsError("Segment pas encore généré", 404, "absent");
 
   // Scripts de pré-génération / régénération : on veut la vraie voix ou une
   // erreur explicite (le script réessaiera), jamais un secours Piper.

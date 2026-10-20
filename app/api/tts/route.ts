@@ -82,9 +82,13 @@ export async function GET(req: NextRequest) {
             voiceId,
             batch: internal && params.get("batch") === "1",
             client: clientTag,
+            // En-tête et non paramètre : l'URL doit rester identique à celle
+            // du kiosque, c'est la clé du cache de la tablette.
+            cacheOnly: req.headers.get("x-tts-cache-only") === "1",
           });
   } catch (err) {
     if (err instanceof TtsError) {
+      if (err.code === "absent") return errorResponse(err.message, 404, err.code);
       logTts({ evt: "error", code: err.code, kind: resolved.kind, message: err.message.slice(0, 200) });
       return errorResponse(err.message, err.status, err.code);
     }

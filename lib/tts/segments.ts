@@ -2,7 +2,7 @@
 // l'autre : "La commande" + identifiant + "est prête." au lieu d'une phrase
 // entière par prénom. Les segments fixes sont générés une seule fois pour
 // tout le monde, seul l'identifiant varie.
-import { FIXED, resolveSegment, ttsUrl, type TtsCtx } from "./text.ts";
+import { FIXED, resolveSegment, urlFor, type TtsCtx } from "./text.ts";
 
 export type Part = { url: string } | { pause: number };
 
@@ -23,9 +23,14 @@ export type Announcement = {
 // Pause marquée par la virgule entre deux identifiants d'un groupe.
 const LIST_PAUSE_MS = 180;
 
+// Segment invalide (prénom avec des chiffres...) : URL brute, le serveur
+// répondra 400 et le kiosque affichera son message d'erreur.
+function rawUrl(seg: string, ctx: TtsCtx): string {
+  return `/api/tts?${new URLSearchParams({ seg, ctx }).toString()}`;
+}
+
 function part(seg: string, ctx: TtsCtx, voiceTag: string): Part {
-  const r = resolveSegment(seg, ctx);
-  return { url: ttsUrl(r.ok ? r.input : seg, ctx, voiceTag) };
+  return { url: urlFor(seg, ctx, voiceTag) ?? rawUrl(seg, ctx) };
 }
 
 function spokenOf(id: Identifier): string {
@@ -81,5 +86,5 @@ export function buildLibreAnnouncement(text: string, label: string, voiceTag: st
 }
 
 export function piperUrl(text: string): string {
-  return ttsUrl(text, "libre", "", "piper");
+  return urlFor(text, "libre", "", "piper") ?? rawUrl(text, "libre");
 }

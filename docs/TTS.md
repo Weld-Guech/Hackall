@@ -24,6 +24,27 @@ sur iOS). Si iOS coupe le son (veille, appel), un bandeau rouge
 **Toucher pour réactiver le son** apparaît. Le service worker garde les
 segments définitifs, ce qui permet d'annoncer même sans réseau.
 
+## Sons hors-ligne sur la tablette
+
+Après **Démarrer le service**, la tablette télécharge en arrière-plan tous les
+segments déjà générés pour sa voix : numéros, prénoms pré-générés ou appris,
+et routines du restaurant. La liste vient de `GET /api/tts/catalogue`.
+Une ligne *« Sons hors-ligne : 1 850 / 4 400 »* suit la progression. Ensuite,
+les annonces partent sans latence, même sans réseau.
+
+- Deux téléchargements à la fois, en pause pendant une annonce. Ce qui est
+  déjà sur la tablette est sauté, donc une coupure ne fait rien perdre.
+- Une nouvelle synchronisation a lieu toutes les 30 minutes et au retour du
+  réseau, pour récupérer les nouveaux prénoms.
+- Le téléchargement ne déclenche **jamais** de génération ElevenLabs (en-tête
+  `x-tts-cache-only`). Seuls les fichiers déjà prêts sur le VPS sont copiés.
+  Lance donc la pré-génération d'abord.
+- Corriger un prénom ne change que l'URL de ce prénom : la tablette ne
+  retélécharge que lui, et l'ancienne version est supprimée.
+- **Installe l'app sur l'écran d'accueil de l'iPad** (Safari → Partager → « Sur
+  l'écran d'accueil »). Sinon, iOS peut effacer les données d'un site
+  ouvert depuis plus de 7 jours dans Safari.
+
 ## Mise en place sur le VPS (une fois)
 
 Dans le dossier du projet sur le VPS, une commande par ligne :

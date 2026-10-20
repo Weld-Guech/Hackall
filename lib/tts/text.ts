@@ -8,8 +8,8 @@ import { PHONETIC_MAP } from "../phoneticCorrections.ts";
 export type TtsCtx = "fixe" | "id" | "libre";
 
 // À incrémenter quand le rendu d'un segment change sans que son texte change
-// (modèle ElevenLabs, contexte d'intonation...) : force les navigateurs et le
-// service worker à redemander les fichiers servis en "immutable". Le cache
+// (modèle ElevenLabs, voix par défaut, contexte d'intonation...) : force les
+// tablettes à redemander les fichiers servis en "immutable". Le cache
 // disque du serveur, lui, a sa propre clé (voir lib/tts/server.ts).
 export const TTS_PIPELINE_VERSION = "1";
 
@@ -62,11 +62,6 @@ export function shortHash(s: string): string {
   }
   return h.toString(36);
 }
-
-// Change dès qu'une correction phonétique est ajoutée ou modifiée : les
-// navigateurs redemandent alors les segments, le serveur ne régénère que
-// ceux dont le texte prononcé a réellement changé.
-export const TTS_URL_VERSION = `${TTS_PIPELINE_VERSION}.${shortHash(JSON.stringify(PHONETIC_MAP))}`;
 
 // Convertit un nombre (0-999) en toutes lettres françaises, pour éviter
 // que le TTS ne lise les chiffres un par un sur les nombres composés
@@ -163,10 +158,23 @@ export function resolveSegment(seg: string, ctx: string): ResolveResult {
   return { ok: false, error: "Contexte inconnu" };
 }
 
-// voiceTag : empreinte de la voix du restaurant, pour qu'un changement de
-// voix ne rejoue pas l'ancienne depuis le cache "immutable" du navigateur.
-export function ttsUrl(seg: string, ctx: TtsCtx, voiceTag: string, engine?: "piper"): string {
-  const params = new URLSearchParams({ seg, ctx, v: voiceTag ? `${TTS_URL_VERSION}.${voiceTag}` : TTS_URL_VERSION });
+// URL d'un segment. Le paramètre v change dès que le son du segment change,
+// pour contourner le cache "immutable" des tablettes :
+//   - empreinte du texte prononcé : corriger un prénom ne change que l'URL
+//     de ce prénom (la tablette ne retélécharge que lui) ;
+//   - voiceTag, empreinte de la voix du restaurant ;
+//   - TTS_PIPELINE_VERSION pour tout le reste.
+// Le kiosque et le téléchargement hors-ligne doivent passer tous les deux
+// par cette fonction : le cache de la tablette est indexé par URL exacte.
+export function segmentUrl(r: ResolvedSegment, voiceTag: string, engine?: "piper"): string {
+  const v = [TTS_PIPELINE_VERSION, shortHash(r.spoken), voiceTag].filter(Boolean).join(".");
+  const params = new URLSearchParams({ seg: r.input, ctx: r.ctx, v });
   if (engine) params.set("engine", engine);
   return `/api/tts?${params.toString()}`;
+}
+
+// Raccourci pour un segment brut ; null s'il est invalide.
+export function urlFor(seg: string, ctx: TtsCtx, voiceTag: string, engine?: "piper"): string | null {
+  const r = resolveSegment(seg, ctx);
+  return r.ok ? segmentUrl(r, voiceTag, engine) : null;
 }
