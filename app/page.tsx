@@ -4,15 +4,28 @@ import { useEffect, useRef, useState } from "react";
 import { useRouter } from "next/navigation";
 import { useWakeLock } from "@/hooks/useWakeLock";
 import { PRENOMS_ARABES } from "@/lib/prenomsArabes";
-import { PHONETIC_MAP } from "@/lib/phoneticCorrections";
 import { normalizeName } from "@/lib/normalizeName";
-import { playbackGuardMs, resumeWithTimeout } from "@/lib/audioPlayback";
+import { resumeWithTimeout } from "@/lib/audioPlayback";
+import { SegmentPlayer, type LoadedPart } from "@/lib/audio/segmentPlayer";
+import { shortHash } from "@/lib/tts/text";
+import {
+  buildIdsAnnouncement,
+  buildLibreAnnouncement,
+  fixedParts,
+  piperUrl,
+  type Announcement,
+  type Part,
+} from "@/lib/tts/segments";
 
 type Ticket = {
   id: string;
   label: string;
   time: string;
-  url: string;
+  // Anciennes annonces (phrase entière) : une seule URL. Nouvelles : la
+  // liste des segments, rejouée à l'identique.
+  url?: string;
+  parts?: Part[];
+  piperText?: string | null;
   text: string;
 };
 
@@ -25,106 +38,18 @@ type Routine = {
 type Mode = "numero" | "libre" | "routines";
 
 const MAX_SUGGESTIONS = 6;
-// Doit rester identique à AUDIO_CACHE dans public/sw.js.
-const AUDIO_CACHE = "appelresto-audio-v3";
 
-// Convertit un nombre (0-999) en toutes lettres françaises, pour éviter
-// que le TTS ne lise les chiffres un par un sur les nombres composés
-// (125 lu "cent vingt-cinq" plutôt que "un deux cinq").
-function numberToFrenchWords(n: number): string {
-  if (n === 0) return "zéro";
-
-  const units = [
-    "", "un", "deux", "trois", "quatre", "cinq", "six", "sept", "huit", "neuf",
-    "dix", "onze", "douze", "treize", "quatorze", "quinze", "seize",
-    "dix-sept", "dix-huit", "dix-neuf",
-  ];
-  const tens = ["", "", "vingt", "trente", "quarante", "cinquante", "soixante"];
-
-  function twoDigits(n: number): string {
-    if (n < 20) return units[n];
-    const t = Math.floor(n / 10);
-    const u = n % 10;
-
-    if (t === 7 || t === 9) {
-      const base = t === 7 ? "soixante" : "quatre-vingt";
-      if (u === 1 && t === 7) return `${base}-et-onze`;
-      return `${base}-${units[10 + u]}`;
-    }
-    if (t === 8) {
-      return u === 0 ? "quatre-vingts" : `quatre-vingt-${units[u]}`;
-    }
-    if (u === 0) return tens[t];
-    if (u === 1) return `${tens[t]}-et-un`;
-    return `${tens[t]}-${units[u]}`;
-  }
-
-  const h = Math.floor(n / 100);
-  const rest = n % 100;
-
-  if (h === 0) return twoDigits(rest);
-
-  let str = h === 1 ? "cent" : `${units[h]} cent`;
-  if (h > 1 && rest === 0) str += "s"; // "deux cents" mais "deux cent vingt"
-  if (rest > 0) str += ` ${twoDigits(rest)}`;
-
-  return str;
-}
-
-function buildAnnouncement(
-  numero: string,
-  prenom: string,
-  texteLibre: string
-): { text: string; cacheKey: string; label: string } {
-  if (texteLibre.trim()) {
-    const t = texteLibre.trim();
-    return {
-      text: t,
-      cacheKey: `libre_${t}`,
-      label: t.length > 28 ? `${t.slice(0, 28)}…` : t,
-    };
-  }
-  const identifiant = prenom.trim() || numberToFrenchWords(parseInt(numero, 10) || 0);
-  const spoken = PHONETIC_MAP[identifiant.toLowerCase()] ?? identifiant;
-  return {
-    text: `La commande ${spoken} est prête.`,
-    cacheKey: prenom.trim() ? `prenom_${prenom.trim()}` : `numero_${numero}`,
-    label: prenom.trim() ? prenom.trim() : `N° ${numero}`,
-  };
-}
-
+// Un identifiant d'annonce (prénom ou numéro), seul ou dans un groupe de 3
+// au maximum ("Les commandes X, Y et Z sont prêtes.").
 type GroupEntry = {
   raw: string;
-  spoken: string;
   label: string;
   key: string;
   isName: boolean;
 };
 
-// Regroupe jusqu'à 3 identifiants (prénoms et/ou numéros) dans une seule
-// annonce : "La commande X est prête." pour un seul, "Les commandes X, Y
-// et Z sont prêtes." à partir de deux.
-function buildGroupAnnouncement(
-  entries: GroupEntry[]
-): { text: string; cacheKey: string; label: string } {
-  if (entries.length <= 1) {
-    const e = entries[0];
-    return {
-      text: `La commande ${e.spoken} est prête.`,
-      cacheKey: e.key,
-      label: e.label,
-    };
-  }
-  const spokenList = entries.map((e) => e.spoken);
-  const joined =
-    spokenList.length === 2
-      ? spokenList.join(" et ")
-      : `${spokenList.slice(0, -1).join(", ")} et ${spokenList[spokenList.length - 1]}`;
-  return {
-    text: `Les commandes ${joined} sont prêtes.`,
-    cacheKey: `groupe_${entries.map((e) => e.key).join("__")}`,
-    label: entries.map((e) => e.label).join(", "),
-  };
+function libreLabel(t: string): string {
+  return t.length > 28 ? `${t.slice(0, 28)}…` : t;
 }
 
 export default function Kiosk() {
@@ -149,23 +74,19 @@ export default function Kiosk() {
   const suggestionsRef = useRef<HTMLDivElement>(null);
 
   // --- Web Audio API ---------------------------------------------------
-  // On abandonne l'élément <audio> et son play() (soumis à des blocages
-  // autoplay intermittents et opaques sur iPad en PWA). À la place :
-  //   - un AudioContext unique, débloqué une fois par un geste utilisateur
-  //     et réveillé (resume) à chaque annonce ;
-  //   - le MP3 est téléchargé en ArrayBuffer, décodé en AudioBuffer (mis en
-  //     cache par cacheKey), puis joué via un AudioBufferSourceNode.
-  // Cette voie n'est pas soumise aux mêmes règles d'autoplay que
-  // HTMLMediaElement.play() et démarre de façon fiable une fois le contexte
-  // débloqué.
-  const audioCtxRef = useRef<AudioContext | null>(null);
-  const bufferCacheRef = useRef<Record<string, AudioBuffer>>({});
-  const currentSourceRef = useRef<AudioBufferSourceNode | null>(null);
+  // Un seul AudioContext (dans SegmentPlayer), débloqué par le bouton
+  // "Démarrer le service" : sur iOS, aucun son n'est possible avant un geste
+  // utilisateur, et un déblocage "au premier contact n'importe où" laissait
+  // le kiosque muet tant que personne n'avait touché l'écran.
+  const playerRef = useRef<SegmentPlayer | null>(null);
+  const [serviceStarted, setServiceStarted] = useState(false);
+  const [audioState, setAudioState] = useState<string>("suspended");
+  // Empreinte de la voix du restaurant, ajoutée aux URL de segments.
+  const [voiceTag, setVoiceTag] = useState<string | null>(null);
   // File de lecture unique : chaque annonce attend la fin de la précédente
   // au lieu de la couper (ou d'être ignorée). Le téléchargement, lui, démarre
   // tout de suite, en parallèle de la lecture en cours.
   const playQueueRef = useRef<Promise<void>>(Promise.resolve());
-  const prefetchedRef = useRef<Record<string, string>>({});
 
   const suggestions =
     prenom.trim().length > 0
@@ -196,6 +117,7 @@ export default function Kiosk() {
       const data = await res.json();
       setClientId(data.id);
       setRestaurantName(data.restaurantName ?? "");
+      setVoiceTag(shortHash(typeof data.voiceId === "string" ? data.voiceId : ""));
       setRoutines(Array.isArray(data.routines) ? data.routines : []);
       setCustomNames(Array.isArray(data.customNames) ? data.customNames : []);
     });
@@ -237,103 +159,88 @@ export default function Kiosk() {
       ? Boolean(numero.trim() || prenom.trim() || groupItems.length > 0)
       : false);
 
-  // Crée le contexte à la volée et le débloque au tout premier geste. Sur
-  // iOS un AudioContext démarre en état "suspended" et ne peut passer à
-  // "running" que pendant (ou juste après) un geste utilisateur ; une fois
-  // "running", il le reste, et un resume() suffit à le réveiller s'il a été
-  // suspendu par une mise en veille.
-  function ensureAudioContext(): AudioContext | null {
-    if (typeof window === "undefined") return null;
-    if (!audioCtxRef.current) {
-      const Ctor =
-        window.AudioContext ||
-        (window as unknown as { webkitAudioContext?: typeof AudioContext }).webkitAudioContext;
-      if (!Ctor) return null;
-      audioCtxRef.current = new Ctor();
+  // Appelé uniquement depuis un geste utilisateur (bouton de démarrage,
+  // bandeau de réactivation, tout contact avec l'écran).
+  async function unlockAudio(): Promise<boolean> {
+    if (!playerRef.current) {
+      playerRef.current = SegmentPlayer.create();
+      if (!playerRef.current) {
+        setError("Audio non supporté sur ce navigateur.");
+        return false;
+      }
+      const ctx = playerRef.current.ctx;
+      ctx.addEventListener("statechange", () => setAudioState(ctx.state));
     }
-    return audioCtxRef.current;
+    const ok = await playerRef.current.unlock();
+    setAudioState(playerRef.current.ctx.state);
+    return ok;
+  }
+
+  async function startService() {
+    await unlockAudio();
+    setServiceStarted(true);
   }
 
   useEffect(() => {
-    // Débloque le contexte au tout premier contact avec l'écran. On joue
-    // aussi un buffer vide d'un échantillon : sur iOS, cet appel à start()
-    // pendant le geste est ce qui "arme" durablement la sortie audio.
-    const unlock = () => {
-      const ctx = ensureAudioContext();
-      if (!ctx) return;
-      const kick = () => {
-        try {
-          const buf = ctx.createBuffer(1, 1, 22050);
-          const src = ctx.createBufferSource();
-          src.buffer = buf;
-          src.connect(ctx.destination);
-          src.start(0);
-        } catch {
-          // sans importance : le resume() ci-dessus est l'essentiel
-        }
-      };
-      if (ctx.state === "suspended") {
-        ctx.resume().then(kick).catch(() => {});
-      } else {
-        kick();
-      }
-      window.removeEventListener("pointerdown", unlock);
-      window.removeEventListener("touchend", unlock);
+    if (!serviceStarted) return;
+    // Tout contact avec l'écran réveille le son s'il a été coupé (veille
+    // iOS, appel entrant...) : resume() n'est accepté que pendant un geste.
+    const onTouch = () => {
+      const player = playerRef.current;
+      if (player && !player.running) void unlockAudio();
     };
-    window.addEventListener("pointerdown", unlock);
-    window.addEventListener("touchend", unlock);
+    // Au retour sur l'onglet, on tente un réveil sans geste ; s'il est
+    // refusé, le bandeau "Toucher pour réactiver le son" s'affiche.
+    const onVisible = () => {
+      const player = playerRef.current;
+      if (document.visibilityState !== "visible" || !player) return;
+      if (!player.running) player.ctx.resume().catch(() => {});
+      setAudioState(player.ctx.state);
+    };
+    window.addEventListener("pointerdown", onTouch);
+    document.addEventListener("visibilitychange", onVisible);
     return () => {
-      window.removeEventListener("pointerdown", unlock);
-      window.removeEventListener("touchend", unlock);
+      window.removeEventListener("pointerdown", onTouch);
+      document.removeEventListener("visibilitychange", onVisible);
     };
-  }, []);
+  }, [serviceStarted]);
 
+  // Précharge les segments fixes ("La commande", "est prête."...) dès que
+  // le service est démarré et la voix du restaurant connue.
   useEffect(() => {
-    if (!canCall) return;
-    if (mode !== "numero" || prenom.trim() || groupItems.length > 0) return;
+    const player = playerRef.current;
+    if (!serviceStarted || voiceTag === null || !player) return;
+    fixedParts(voiceTag).forEach((p) => {
+      if ("url" in p) player.load(p.url).catch(() => {});
+    });
+  }, [serviceStarted, voiceTag]);
 
-    const { text, cacheKey } = buildAnnouncement(numero, prenom, texteLibre);
-    if (!cacheKey.startsWith("numero_")) return;
-    if (prefetchedRef.current[cacheKey]) return;
-
-    const timer = setTimeout(() => {
-      fetch("/api/tts", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ text, cacheKey }),
-      })
-        .then((res) => res.json())
-        .then((data) => {
-          if (data.url) {
-            prefetchedRef.current[cacheKey] = data.url;
-          }
-        })
-        .catch(() => {});
-    }, 250);
-
+  // Précharge le segment d'un numéro pendant la saisie (les prénoms ne sont
+  // préchargés qu'une fois choisis dans les suggestions : précharger "Ray",
+  // "Raya"... déclencherait des générations inutiles).
+  useEffect(() => {
+    const player = playerRef.current;
+    if (!player || voiceTag === null || mode !== "numero" || prenom.trim()) return;
+    if (!/^\d{1,3}$/.test(numero)) return;
+    const timer = setTimeout(() => prefetchIdentifier(numero), 250);
     return () => clearTimeout(timer);
-  }, [numero, prenom, texteLibre, canCall, mode, groupItems.length]);
+  }, [numero, prenom, mode, voiceTag]);
+
+  function prefetchIdentifier(raw: string) {
+    const player = playerRef.current;
+    if (!player || voiceTag === null) return;
+    const [, idPart] = buildIdsAnnouncement([{ raw, label: raw }], voiceTag).parts;
+    if (idPart && "url" in idPart) player.load(idPart.url).catch(() => {});
+  }
 
   function currentEntry(): GroupEntry | null {
     if (prenom.trim()) {
       const raw = prenom.trim();
-      return {
-        raw,
-        spoken: PHONETIC_MAP[raw.toLowerCase()] ?? raw,
-        label: raw,
-        key: `prenom_${raw}`,
-        isName: true,
-      };
+      return { raw, label: raw, key: `prenom_${raw}`, isName: true };
     }
     if (numero.trim()) {
       const raw = numero.trim();
-      return {
-        raw,
-        spoken: numberToFrenchWords(parseInt(raw, 10) || 0),
-        label: `N° ${raw}`,
-        key: `numero_${raw}`,
-        isName: false,
-      };
+      return { raw, label: `N° ${raw}`, key: `numero_${raw}`, isName: false };
     }
     return null;
   }
@@ -351,203 +258,78 @@ export default function Kiosk() {
     setGroupItems((g) => g.filter((_, i) => i !== index));
   }
 
-  function decode(arrayBuf: ArrayBuffer, ctx: AudioContext): Promise<AudioBuffer> {
-    // Copie avant décodage : decodeAudioData détache (neuter) l'ArrayBuffer.
-    // On n'utilise qu'une seule API (promesse OU callback) sur cette copie :
-    // les deux à la fois faisaient échouer le 2e passage une fois le buffer détaché.
-    const copy = arrayBuf.slice(0);
-    const p = ctx.decodeAudioData(copy);
-    if (p && typeof p.then === "function") return p;
-    return new Promise<AudioBuffer>((resolve, reject) => {
-      ctx.decodeAudioData(arrayBuf.slice(0), resolve, reject);
-    });
-  }
-
-  // Récupère l'AudioBuffer décodé pour une URL donnée (cache par cacheKey).
-  async function loadBuffer(url: string, cacheKey: string, ctx: AudioContext): Promise<AudioBuffer> {
-    const cached = bufferCacheRef.current[cacheKey];
-    if (cached) return cached;
-    const res = await fetch(url);
-    if (!res.ok) throw new Error(`Téléchargement audio échoué (${res.status})`);
-    const buffer = await decode(await res.arrayBuffer(), ctx);
-    bufferCacheRef.current[cacheKey] = buffer;
-    return buffer;
-  }
-
-  // Une seule requête : le serveur renvoie directement le MP3 (en streaming
-  // s'il est en cours de génération) au lieu d'une URL à retélécharger.
-  async function fetchAnnouncement(
-    text: string,
-    cacheKey: string,
-    ctx: AudioContext,
-    marks: Record<string, number>
-  ): Promise<{ buffer: AudioBuffer; url: string; cache: string }> {
-    const cached = bufferCacheRef.current[cacheKey];
-    const prefetchedUrl = prefetchedRef.current[cacheKey];
-    if (cached && prefetchedUrl) return { buffer: cached, url: prefetchedUrl, cache: "memory" };
-    if (prefetchedUrl) {
-      const buffer = await loadBuffer(prefetchedUrl, cacheKey, ctx);
-      marks.downloaded = performance.now();
-      return { buffer, url: prefetchedUrl, cache: "prefetch" };
-    }
-
-    const res = await fetch("/api/tts", {
-      method: "POST",
-      headers: { "Content-Type": "application/json", Accept: "audio/mpeg" },
-      body: JSON.stringify({ text, cacheKey }),
-    });
-    marks.headers = performance.now();
-    if (!res.ok) {
-      const data = await res.json().catch(() => ({}));
-      throw new Error(data.error ?? `Erreur serveur (${res.status})`);
-    }
-    const url = res.headers.get("X-Audio-Url") ?? "";
-    const cache = res.headers.get("X-Cache") ?? "?";
-    const arrayBuf = await res.arrayBuffer();
-    marks.downloaded = performance.now();
-
-    // Copie synchrone avant decodeAudioData, qui détache arrayBuf.
-    // Le caches.open() est async : slicer dans son then() arrive trop tard.
-    const mpegForCache = arrayBuf.slice(0);
-    if (url && "caches" in window) {
-      caches
-        .open(AUDIO_CACHE)
-        .then((c) =>
-          c.put(url, new Response(mpegForCache, { headers: { "Content-Type": "audio/mpeg" } }))
-        )
-        .catch(() => {});
-    }
-
-    const buffer = await decode(arrayBuf, ctx);
-    marks.decoded = performance.now();
-    bufferCacheRef.current[cacheKey] = buffer;
-    if (url) prefetchedRef.current[cacheKey] = url;
-    return { buffer, url, cache };
-  }
-
-  // Joue un buffer et se résout à la fin de la lecture. Filet de sécurité :
-  // si "onended" ne se déclenche jamais (contexte suspendu par iOS), on libère
-  // la file après un délai plafonné — sans plafond, duration === Infinity
-  // bloque toutes les annonces suivantes (historique OK, silence).
-  function playBuffer(buffer: AudioBuffer, ctx: AudioContext): Promise<void> {
-    return new Promise((resolve) => {
-      let settled = false;
-      let src: AudioBufferSourceNode | null = null;
-      let guard = 0;
-
-      const finish = () => {
-        if (settled) return;
-        settled = true;
-        clearTimeout(guard);
-        if (src) {
-          try {
-            src.stop();
-          } catch {
-            // déjà arrêté
-          }
-          try {
-            src.disconnect();
-          } catch {
-            // déjà déconnecté
-          }
-        }
-        if (currentSourceRef.current === src) currentSourceRef.current = null;
-        resolve();
-      };
-
+  // Télécharge les segments d'une annonce. Si l'un d'eux n'est qu'une
+  // version provisoire (Piper, ElevenLabs indisponible), toute la phrase est
+  // relue par Piper pour ne pas mélanger deux voix ; si cette relecture
+  // échoue, on joue quand même les segments tels quels.
+  async function loadAnnouncement(
+    player: SegmentPlayer,
+    a: Pick<Announcement, "parts" | "piperText">
+  ): Promise<{ parts: LoadedPart[]; provisional: boolean }> {
+    const parts = await player.loadAll(a.parts);
+    const provisional = parts.some((p) => "buffer" in p && !p.final);
+    if (provisional && a.piperText) {
       try {
-        if (currentSourceRef.current) {
-          try {
-            currentSourceRef.current.stop();
-          } catch {
-            // source précédente déjà terminée
-          }
-          try {
-            currentSourceRef.current.disconnect();
-          } catch {
-            // déjà déconnectée
-          }
-        }
-        src = ctx.createBufferSource();
-        src.buffer = buffer;
-        src.connect(ctx.destination);
-        guard = window.setTimeout(finish, playbackGuardMs(buffer.duration));
-        src.onended = finish;
-        src.start();
-        currentSourceRef.current = src;
+        return { parts: [await player.load(piperUrl(a.piperText))], provisional };
       } catch {
-        finish();
+        // on garde le mélange de voix plutôt que le silence
       }
-    });
+    }
+    return { parts, provisional };
   }
 
   // Ajoute une lecture à la file : elle démarre dès que la précédente est
-  // terminée et que son propre buffer est prêt, dans l'ordre des clics.
+  // terminée et que ses propres segments sont prêts, dans l'ordre des clics.
   function enqueuePlayback(
-    bufferPromise: Promise<AudioBuffer>,
-    ctx: AudioContext,
+    player: SegmentPlayer,
+    partsPromise: Promise<LoadedPart[]>,
     onStart?: () => void
   ): Promise<void> {
     const previous = playQueueRef.current;
     const mine = (async () => {
-      const buffer = await bufferPromise;
+      const parts = await partsPromise;
       await previous;
-      if (ctx.state === "suspended") {
-        await resumeWithTimeout(() => ctx.resume());
+      if (!player.running) {
+        await resumeWithTimeout(() => player.ctx.resume());
       }
       onStart?.();
-      await playBuffer(buffer, ctx);
+      await player.play(parts);
     })();
     playQueueRef.current = mine.catch(() => {});
     return mine;
   }
 
-  async function announce(text: string, cacheKey: string, label: string): Promise<boolean> {
-    // Mesures de latence (console + ligne de debug à l'écran) :
-    // clic → en-têtes serveur → MP3 reçu → décodé → premier son.
-    const marks: Record<string, number> = { clicked: performance.now() };
-
+  async function announce(a: Announcement): Promise<boolean> {
+    // Mesure de latence (console + ligne de debug à l'écran) :
+    // clic → premier son, attente de la file incluse.
+    const clicked = performance.now();
     setError(null);
-    setIsLoading(true);
 
-    const ctx = ensureAudioContext();
-    if (!ctx) {
-      setError("Audio non supporté sur ce navigateur.");
-      setIsLoading(false);
+    const player = playerRef.current;
+    if (!player) {
+      setError("Touchez « Démarrer le service » pour activer le son.");
       return false;
     }
+    setIsLoading(true);
 
-    // On réveille le contexte de façon synchrone dans le geste (le clic qui
-    // a déclenché announce). C'est le point clé sur iPad.
-    try {
-      if (ctx.state === "suspended") await resumeWithTimeout(() => ctx.resume());
-    } catch {
-      // on tente quand même la suite
-    }
-    setDebug(`ctx=${ctx.state}`);
-
-    const ms = (k: string) => (marks[k] ? Math.round(marks[k] - marks.clicked) : null);
+    // On réveille le contexte dans le geste (le clic qui a déclenché
+    // announce). C'est le point clé sur iPad.
+    if (!player.running) await resumeWithTimeout(() => player.ctx.resume());
 
     // La place dans la file est réservée dès le clic, pendant que le
     // téléchargement tourne : l'ordre des annonces suit l'ordre des clics.
-    const fetching = fetchAnnouncement(text, cacheKey, ctx, marks);
+    const loading = loadAnnouncement(player, a);
     enqueuePlayback(
-      fetching.then((r) => r.buffer),
-      ctx,
+      player,
+      loading.then((l) => l.parts),
       () => {
-        marks.played = performance.now();
-        fetching.then(({ buffer, cache }) => {
-          const metrics = {
-            cache,
-            headers_ms: ms("headers"),
-            downloaded_ms: ms("downloaded"),
-            decoded_ms: ms("decoded"),
-            first_sound_ms: ms("played"),
-            duration_s: Number(buffer.duration.toFixed(2)),
-          };
-          console.info("[annonce]", metrics);
+        const firstSoundMs = Math.round(performance.now() - clicked);
+        loading.then(({ provisional }) => {
+          console.info("[annonce]", { first_sound_ms: firstSoundMs, provisional });
           setDebug(
-            `ctx=${ctx.state} ${cache} · premier son ${metrics.first_sound_ms} ms (attente file incluse)`
+            `ctx=${player.ctx.state} · premier son ${firstSoundMs} ms (attente file incluse)${
+              provisional ? " · voix de secours" : ""
+            }`
           );
         });
       }
@@ -556,15 +338,15 @@ export default function Kiosk() {
     });
 
     try {
-      const { url } = await fetching;
-      marks.decoded = marks.decoded ?? performance.now();
+      await loading;
       setHistory((prev) => [
         {
           id: `${Date.now()}`,
-          label,
+          label: a.label,
           time: new Date().toLocaleTimeString("fr-FR", { hour: "2-digit", minute: "2-digit" }),
-          url,
-          text,
+          parts: a.parts,
+          piperText: a.piperText,
+          text: a.text,
         },
         ...prev,
       ].slice(0, 12));
@@ -572,7 +354,7 @@ export default function Kiosk() {
     } catch (err) {
       const msg = err instanceof Error ? err.message : "Échec de l'annonce";
       setError(msg);
-      setDebug(`ERREUR: ${msg} (ctx=${ctx.state})`);
+      setDebug(`ERREUR: ${msg} (ctx=${player.ctx.state})`);
       return false;
     } finally {
       setIsLoading(false);
@@ -602,10 +384,11 @@ export default function Kiosk() {
 
   async function handleCall() {
     if (!canCall) return;
+    const tag = voiceTag ?? "";
 
     if (mode === "libre") {
-      const { text, cacheKey, label } = buildAnnouncement(numero, prenom, texteLibre);
-      await announce(text, cacheKey, label);
+      const t = texteLibre.trim();
+      await announce(buildLibreAnnouncement(t, libreLabel(t), tag));
       setTexteLibre("");
       return;
     }
@@ -615,8 +398,7 @@ export default function Kiosk() {
       groupItems.length >= 3 ? groupItems : [...groupItems, ...(current ? [current] : [])];
     if (entries.length === 0) return;
 
-    const { text, cacheKey, label } = buildGroupAnnouncement(entries);
-    const ok = await announce(text, cacheKey, label);
+    const ok = await announce(buildIdsAnnouncement(entries, tag));
     if (ok) {
       entries.forEach((e) => {
         if (e.isName) learnNameIfNew(e.raw);
@@ -629,16 +411,24 @@ export default function Kiosk() {
 
   async function handleRoutineCall(routine: Routine) {
     if (isLoading) return;
-    await announce(routine.text, `routine_${routine.text}`, routine.label);
+    await announce(buildLibreAnnouncement(routine.text, routine.label, voiceTag ?? ""));
   }
 
   async function handleReplay(ticket: Ticket) {
     setError(null);
+    const player = playerRef.current;
+    if (!player) {
+      setError("Touchez « Démarrer le service » pour activer le son.");
+      return;
+    }
     try {
-      const ctx = ensureAudioContext();
-      if (!ctx) throw new Error("Audio non supporté.");
-      if (ctx.state === "suspended") await ctx.resume();
-      await enqueuePlayback(loadBuffer(ticket.url, `replay_${ticket.id}`, ctx), ctx);
+      if (!player.running) await resumeWithTimeout(() => player.ctx.resume());
+      const parts = ticket.parts
+        ? loadAnnouncement(player, { parts: ticket.parts, piperText: ticket.piperText ?? null }).then(
+            (l) => l.parts
+          )
+        : player.loadAll(ticket.url ? [{ url: ticket.url }] : []);
+      await enqueuePlayback(player, parts);
     } catch {
       setError("Impossible de rejouer cette annonce.");
     }
@@ -657,6 +447,20 @@ export default function Kiosk() {
 
   return (
     <main style={styles.main}>
+      {mounted && !serviceStarted && (
+        <div style={styles.startOverlay}>
+          <span style={styles.eyebrow}>{(restaurantName || "…").toUpperCase()}</span>
+          <button style={styles.startButton} onClick={startService}>
+            Démarrer le service
+          </button>
+          <p style={styles.hint}>Active le son des annonces sur cet appareil.</p>
+        </div>
+      )}
+      {serviceStarted && audioState !== "running" && (
+        <button style={styles.audioBanner} onClick={() => void unlockAudio()}>
+          🔇 Toucher pour réactiver le son
+        </button>
+      )}
       <header style={styles.header}>
         <span style={styles.eyebrow}>
           {(restaurantName || "…").toUpperCase()} · COMPTOIR
@@ -774,6 +578,7 @@ export default function Kiosk() {
                             onClick={() => {
                               setPrenom(s);
                               setShowSuggestions(false);
+                              prefetchIdentifier(s);
                             }}
                           >
                             {s}
@@ -893,6 +698,44 @@ const styles: Record<string, React.CSSProperties> = {
     flexDirection: "column",
     padding: "24px 32px",
     gap: 24,
+  },
+  startOverlay: {
+    position: "fixed",
+    inset: 0,
+    zIndex: 100,
+    display: "flex",
+    flexDirection: "column",
+    alignItems: "center",
+    justifyContent: "center",
+    gap: 20,
+    background: "var(--bg)",
+  },
+  startButton: {
+    background: "var(--accent)",
+    border: "none",
+    borderRadius: 16,
+    color: "#1c1b1a",
+    fontFamily: "var(--font-display)",
+    fontSize: 32,
+    fontWeight: 600,
+    letterSpacing: "0.04em",
+    padding: "28px 48px",
+    cursor: "pointer",
+  },
+  audioBanner: {
+    position: "fixed",
+    top: 0,
+    left: 0,
+    right: 0,
+    zIndex: 90,
+    background: "#d97757",
+    border: "none",
+    color: "#1c1b1a",
+    fontFamily: "var(--font-body)",
+    fontSize: 18,
+    fontWeight: 700,
+    padding: "16px 0",
+    cursor: "pointer",
   },
   header: {
     display: "flex",
