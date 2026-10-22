@@ -53,6 +53,28 @@ const TRIM_FILTER = [
   "areverse",
 ].join(",");
 
+// --- Contrôle de durée ------------------------------------------------------
+// Sur un mot isolé (prénom, numéro) envoyé avec previous_text / next_text,
+// ElevenLabs renvoie parfois un son tronqué ou quasi vide. Sans contrôle, ce
+// fichier part en cache "immutable" et le prénom reste coupé pour toujours.
+// Tous nos MP3 sont en CBR 128 kb/s (ElevenLabs mp3_44100_128 et ffmpeg
+// -b:a 128k) : la durée se déduit de la taille, sans lancer ffprobe.
+const MP3_BYTES_PER_S = 128_000 / 8;
+
+export function mp3DurationS(audio: Buffer | number): number {
+  return (typeof audio === "number" ? audio : audio.length) / MP3_BYTES_PER_S;
+}
+
+// Durée minimale plausible d'un identifiant prononcé ("un" ≈ 0,2 s,
+// "Fatima-Zahra" ≈ 0,9 s). Volontairement large : on vise les sons vides ou
+// coupés, pas les voix rapides. Les segments fixes et libres ne sont pas
+// contrôlés.
+export function isTooShort(r: Pick<ResolvedSegment, "kind" | "spoken">, audio: Buffer | number): boolean {
+  if (r.kind !== "prenom" && r.kind !== "numero") return false;
+  const letters = r.spoken.replace(/[^\p{L}]/gu, "").length;
+  return mp3DurationS(audio) < Math.max(0.15, letters * 0.04);
+}
+
 export type TtsSource = "cache" | "cache-provisoire" | "elevenlabs" | "piper";
 export type TtsResult = { audio: Buffer; final: boolean; source: TtsSource };
 
@@ -239,8 +261,20 @@ function generateFinal(key: string, voiceId: string, r: ResolvedSegment): Promis
   const paths = segmentPaths(key);
   const t0 = Date.now();
   const job = (async () => {
-    const raw = await callElevenLabs(voiceId, r, AbortSignal.timeout(GENERATION_TIMEOUT_MS));
-    const audio = await trimToMp3(raw, { required: false });
+    const signal = AbortSignal.timeout(GENERATION_TIMEOUT_MS);
+    let audio = await trimToMp3(await callElevenLabs(voiceId, r, signal), { required: false });
+    if (isTooShort(r, audio)) {
+      // Deuxième essai sans contexte d'intonation : c'est lui qui fait
+      // parfois "avaler" le mot isolé par le modèle.
+      logTts({ evt: "too_short", key: key.slice(0, 10), kind: r.kind, s: mp3DurationS(audio).toFixed(2), retry: "sans_contexte" });
+      const bare = { ...r, previous: undefined, next: undefined };
+      audio = await trimToMp3(await callElevenLabs(voiceId, bare, signal), { required: false });
+      if (isTooShort(r, audio)) {
+        logTts({ evt: "too_short", key: key.slice(0, 10), kind: r.kind, s: mp3DurationS(audio).toFixed(2), retry: "abandon" });
+        // Pas d'écriture en cache : l'annonce part en Piper, on réessaiera.
+        throw new TtsError("Son ElevenLabs tronqué", 502, "upstream");
+      }
+    }
     await writeAtomic(paths.final, audio);
     // La vraie voix remplace le secours Piper éventuel.
     await fsp.rm(paths.provisoire, { force: true });
@@ -402,7 +436,14 @@ function withTimeout<T>(p: Promise<T>, ms: number): Promise<T> {
 // Pour l'estimation du script de pré-génération (--essai) : le segment
 // est-il déjà en cache définitif ? Ne génère rien.
 export function hasFinalSegment(r: ResolvedSegment, voiceId: string): boolean {
-  return fs.existsSync(segmentPaths(segmentKey(voiceId, r)).final);
+  const file = segmentPaths(segmentKey(voiceId, r)).final;
+  try {
+    // Un fichier tronqué compte comme absent (pré-génération et catalogue
+    // hors-ligne le traitent alors comme à refaire).
+    return !isTooShort(r, fs.statSync(file).size);
+  } catch {
+    return false;
+  }
 }
 
 export async function getSegmentAudio(
@@ -412,7 +453,14 @@ export async function getSegmentAudio(
   const key = segmentKey(opts.voiceId, r);
   const paths = segmentPaths(key);
 
-  const cached = await readIfExists(paths.final);
+  let cached = await readIfExists(paths.final);
+  if (cached && isTooShort(r, cached)) {
+    // Fichier tronqué enregistré avant le contrôle de durée : on le jette,
+    // il sera régénéré ci-dessous (une seule fois par prénom concerné).
+    logTts({ evt: "purge_too_short", key: key.slice(0, 10), kind: r.kind, input: r.input, s: mp3DurationS(cached).toFixed(2) });
+    await fsp.rm(paths.final, { force: true });
+    cached = null;
+  }
   if (cached) {
     // Script de régénération : un provisoire peut subsister si la vraie voix
     // est arrivée par un autre chemin ; on fait le ménage.

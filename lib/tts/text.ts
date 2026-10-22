@@ -11,7 +11,8 @@ export type TtsCtx = "fixe" | "id" | "libre";
 // (modèle ElevenLabs, voix par défaut, contexte d'intonation...) : force les
 // tablettes à redemander les fichiers servis en "immutable". Le cache
 // disque du serveur, lui, a sa propre clé (voir lib/tts/server.ts).
-export const TTS_PIPELINE_VERSION = "1";
+// 2 : purge des prénoms tronqués, que les tablettes gardaient en cache.
+export const TTS_PIPELINE_VERSION = "2";
 
 export const MAX_LIBRE_LENGTH = 500;
 const MAX_NAME_LENGTH = 40;
